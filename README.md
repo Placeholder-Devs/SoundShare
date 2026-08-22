@@ -153,4 +153,3 @@ graphify . --obsidian --obsidian-dir ~/vaults/soundshare
 **Java · Android 12+ · Gradle 8.13 (Kotlin DSL) · AGP 8.13.2 · TCP/IP · FLAC**
 
 </div>
-```

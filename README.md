@@ -1,36 +1,123 @@
-# SoundShare
+<div align="center">
 
-Real-time, high-fidelity audio streaming over local WiFi between Android devices. Captures system audio via MediaProjection API and streams to one or more receivers over TCP/IP, with support for Hi-Res Audio (up to 192kHz/24-bit), FLAC lossless compression, bidirectional chat, and transport controls.
+# 🔊 SoundShare
 
-## Knowledge Graph
+**Real-time, high-fidelity audio streaming between Android devices over local Wi-Fi.**
 
-This project has a graphify Obsidian vault for architecture reference:
+*Capture system audio from any app, stream it losslessly to one or many receivers, chat while you listen, and control playback remotely — up to Hi-Res 192 kHz / 24-bit.*
 
-- **Vault:** `~/vaults/soundshare_v1/`
-- **Graph:** `/home/abinav/AndroidStudioProjects/soundshare_v1/graphify-out/graph.json`
-- **Report:** `/home/abinav/AndroidStudioProjects/soundshare_v1/graphify-out/GRAPH_REPORT.md`
-- **Communities:** MainActivity Core, StreamFragment UI, ReceiveFragment UI, DuplexFragment UI, AudioCaptureService, AudioReceiveService, FLAC Codec, HiResAudioHelper, MediaMetadataHelper, SettingsFragment, ChatAdapter, ChatMessage Model, ChatNotificationHelper, CLAUDE.md Documentation, Icon Density Variants, Build Config (Root/App/Settings), Tests
+[![Platform](https://img.shields.io/badge/Platform-Android-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://developer.android.com)
+[![Min SDK](https://img.shields.io/badge/Min%20SDK-31%20·%20Android%2012-brightgreen?style=for-the-badge)](https://developer.android.com/about/versions/12)
+[![Target SDK](https://img.shields.io/badge/Target%20SDK-36-blue?style=for-the-badge)](https://developer.android.com)
+[![Language](https://img.shields.io/badge/Language-Java-orange?style=for-the-badge&logo=openjdk&logoColor=white)](#)
+[![Gradle](https://img.shields.io/badge/Gradle-8.13-02303A?style=for-the-badge&logo=gradle&logoColor=white)](https://gradle.org)
+[![Protocol](https://img.shields.io/badge/Protocol-TCP%2FIP%20v2-6f42c1?style=for-the-badge)](#-network-protocol)
 
-To rebuild the vault after code changes:
-```bash
-graphify /home/abinav/AndroidStudioProjects/soundshare_v1 --obsidian --obsidian-dir ~/vaults/soundshare_v1
+</div>
+
+<p align="center">
+  <a href="#-features">Features</a> •
+  <a href="#-how-it-works">How it works</a> •
+  <a href="#-network-protocol">Protocol</a> •
+  <a href="#-quality-presets">Presets</a> •
+  <a href="#-getting-started">Getting started</a> •
+  <a href="#-web-ui">Web UI</a> •
+  <a href="#-project-structure">Structure</a> •
+  <a href="#-knowledge-graph">Knowledge graph</a>
+</p>
+
+---
+
+## ✨ Features
+
+| | |
+|:---:|---|
+| 🎙️ **System-wide audio capture** | Grabs audio from any app via the **MediaProjection** API |
+| 📡 **Multi-receiver streaming** | One host → many listeners over local TCP/IP Wi-Fi |
+| 🎼 **Hi-Res Audio** | Up to **192 kHz / 24-bit** for audiophile-grade listening |
+| 🗜️ **FLAC lossless** | Bit-perfect audio with efficient bandwidth usage |
+| 🔄 **Duplex mode** | Full bidirectional audio between two devices |
+| 💬 **Live chat & metadata** | Two-way chat plus track metadata broadcast |
+| 🎮 **Transport controls** | Pause / resume / skip from any receiver |
+| ⚙️ **Deep performance tuning** | Adjustable buffers and quality presets for any network |
+
+<!-- 📸 Screenshots: drop images into docs/ and uncomment
+<p align="center">
+  <img src="docs/screenshots/stream.png"   width="23%" alt="Stream tab" />
+  <img src="docs/screenshots/receive.png"  width="23%" alt="Receive tab" />
+  <img src="docs/screenshots/duplex.png"   width="23%" alt="Duplex tab" />
+  <img src="docs/screenshots/settings.png" width="23%" alt="Settings tab" />
+</p>
+-->
+
+---
+
+## 🗺️ How it works
+
+```mermaid
+flowchart LR
+    A["🎙️ System audio<br/>(MediaProjection)"] --> B["🗜️ FLAC encoder"]
+    B -- "audio · TCP 5000" --> C["🔊 FLAC decoder"]
+    C --> D["🎧 Playback"]
+    B <-. "controls / ping · TCP 5001" .-> C
+    B <-. "chat / metadata · TCP 5002" .-> C
 ```
 
-## Tech Stack
+A single-Activity app with four bottom-navigation tabs:
 
-- **Language**: Java
-- **Min SDK**: 31 (Android 12) / **Target SDK**: 36
-- **Build System**: Gradle 8.13 with Kotlin DSL, Version Catalog
-- **AGP**: 8.13.2
+| Tab | Mode | What it does |
+|---|---|---|
+| 📤 **Stream** | Host / sender | Captures system audio and broadcasts it |
+| 📥 **Receive** | Client / receiver | Decodes and plays incoming streams |
+| 🔁 **Duplex** | Bidirectional | Simultaneous send + receive between two devices |
+| ⚙️ **Settings** | Tuning | Buffers, presets and performance options |
 
-## Build / Run / Test
+---
+
+## 📡 Network protocol
+
+Custom binary protocol **v2** — 28-byte header, magic `SSHD`.
+
+| Port | Purpose |
+|:---:|---|
+| `5000` | Main audio data stream |
+| `5001` | Ping / latency + transport control (pause / resume / skip) |
+| `5002` | Chat + metadata broadcast |
+| `5003` | Duplex audio |
+| `5004` | Duplex chat |
+
+---
+
+## 🎚️ Quality presets
+
+Seven one-tap presets, from battery-saver to audiophile:
+
+| Preset | Sample rate | Channels | Bit depth |
+|---|:---:|:---:|:---:|
+| Ultra Low | 44.1 kHz | Mono | 16-bit |
+| ⭐ **Balanced** *(default)* | 48 kHz | Stereo | 16-bit |
+| Hi-Res Ultra | 192 kHz | Stereo | 24-bit |
+
+*…plus four intermediate presets in between.*
+
+---
+
+## 🚀 Getting started
+
+### Prerequisites
+
+- Android Studio (or Android SDK command-line tools)
+- JDK 11+
+- Android SDK with API 36
+
+### Build & run
 
 ```bash
 # Build
 ./gradlew assembleDebug          # Debug APK
 ./gradlew assembleRelease        # Release APK
 
-# Install on connected device
+# Install on a connected device
 ./gradlew installDebug
 
 # Tests
@@ -38,56 +125,69 @@ graphify /home/abinav/AndroidStudioProjects/soundshare_v1 --obsidian --obsidian-
 ./gradlew connectedAndroidTest   # Instrumented tests
 ```
 
-**Prerequisites**: Android Studio or Android SDK, JDK 11+, Android SDK with API 36.
+> 💡 Host and receiver devices must be on the **same local Wi-Fi network**.
 
-## Architecture
+---
 
-Single-Activity, multi-Fragment with `BottomNavigationView` (4 tabs):
+## 🖥️ Web UI
 
-- **StreamFragment** — host/sender mode
-- **ReceiveFragment** — client/receiver mode
-- **DuplexFragment** — bidirectional mode
-- **SettingsFragment** — buffer/performance tuning (SharedPreferences)
+A responsive recreation of the mobile UI lives in [`web-ui/`](web-ui/) — vanilla HTML/CSS/JS, **no build step required**.
 
-All fragments communicate with `MainActivity` via callback interfaces.
+- 🌗 Playful OLED theme with dark / light toggle
+- 🧭 4-tab navigation: Stream · Receive · Duplex · Settings
+- 📱💻 Responsive from 375 px to 1440 px with animated transitions
+- 📊 Simulated live stats, chat with auto-replies, transport controls
+- ♿ Fully accessible: ARIA roles, keyboard navigation, reduced-motion support
 
-### Network Protocol
-
-Five TCP ports with custom binary protocol v2 (28-byte header, magic "SSHD"):
-
-| Port | Purpose |
-|------|---------|
-| 5000 | Main audio data stream |
-| 5001 | Ping/latency + control (pause/resume/skip) |
-| 5002 | Chat + metadata broadcast |
-| 5003 | Duplex audio |
-| 5004 | Duplex chat |
-
-### Quality Presets
-
-7 presets from 44.1kHz Mono 16-bit (Ultra Low) to 192kHz Stereo 24-bit (Hi-Res Ultra). Default: 48kHz Stereo 16-bit (Balanced).
-
-## Web UI
-
-A responsive web recreation of the SoundShare mobile UI is available in `web-ui/`. Built with vanilla HTML/CSS/JS — no build step required.
-
-**Features:**
-- Playful OLED theme (dark/light mode toggle)
-- 4-tab navigation: Stream, Receive, Duplex, Settings
-- Animated transitions, responsive layout (375px–1440px)
-- Simulated live stats, chat with auto-replies, transport controls
-- Full accessibility: ARIA roles, keyboard navigation, reduced motion support
-
-**Open locally:**
 ```bash
-# Option 1: Open directly in browser
-open web-ui/index.html          # macOS
-xdg-open web-ui/index.html      # Linux
-start web-ui/index.html         # Windows
+# Open directly in a browser
+open web-ui/index.html        # macOS
+xdg-open web-ui/index.html    # Linux
+start web-ui/index.html       # Windows
 
-# Option 2: Serve via Python
-cd web-ui && python3 -m http.server 8765
-# Then visit http://localhost:8765
+# Or serve locally
+cd web-ui && python3 -m http.server 8765   # → http://localhost:8765
 ```
 
-**Files:** 23 files across `index.html`, `css/` (11 files), and `js/` (11 files).
+---
+
+## 📁 Project structure
+
+```
+SoundShare/
+├── app/                  # Android app module (Java)
+│   └── src/              # Activities, fragments, services, FLAC codec
+├── gradle/               # Wrapper + version catalog (libs.versions.toml)
+├── web-ui/               # Web recreation of the mobile UI (HTML/CSS/JS)
+├── graphify-out/         # Generated architecture knowledge graph
+├── build.gradle.kts      # Root build script (Kotlin DSL)
+├── settings.gradle.kts   # Module configuration
+└── gradle.properties
+```
+
+---
+
+## 🧠 Knowledge graph
+
+This repo ships with a graphify knowledge graph for architecture reference in [`graphify-out/`](graphify-out/):
+
+- `graph.json` — machine-readable graph
+- `GRAPH_REPORT.md` — human-readable architecture report
+
+Rebuild after code changes:
+
+```bash
+graphify . --obsidian --obsidian-dir ~/vaults/soundshare_v1
+```
+
+---
+
+<div align="center">
+
+**Java · Android 12+ · Gradle 8.13 (Kotlin DSL) · AGP 8.13.2 · TCP/IP · FLAC**
+
+*SoundShare — because great sound should follow you around the house.* 🏠🎶
+
+</div>
+
+<!-- TODO: add a LICENSE file and a license badge once ready -->

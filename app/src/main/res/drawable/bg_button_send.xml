@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Circular send button with purple gradient -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#309D00FF">
+    <item>
+        <shape android:shape="oval">
+            <gradient
+                android:angle="135"
+                android:startColor="#7A00CC"
+                android:endColor="#9D00FF"
+                android:type="linear" />
+        </shape>
+    </item>
+</ripple>

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="tvFormat" type="id" />
+    <item name="btnReceive" type="id" />
+    <item name="status" type="id" />
+    <item name="tvDeviceIp" type="id" />
+    <item name="tvQualityInfo" type="id" />
+    <item name="ipInput" type="id" />
+    <item name="btnSend" type="id" />
+    <item name="qualitySpinner" type="id" />
+</resources>

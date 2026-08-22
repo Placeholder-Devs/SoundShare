@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Secondary action button — lavender gradient -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#30A47DAB">
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="135"
+                android:startColor="#7A5A8A"
+                android:endColor="#A47DAB"
+                android:type="linear" />
+            <corners android:radius="24dp" />
+        </shape>
+    </item>
+</ripple>

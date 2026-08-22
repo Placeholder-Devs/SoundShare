@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Chat message item: three view types (SENT, RECEIVED, SYSTEM) -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/bubbleContainer"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingVertical="3dp">
+
+    <!-- Sender name (for received messages) -->
+    <TextView
+        android:id="@+id/tvChatSender"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Sender"
+        android:textSize="11sp"
+        android:textColor="@color/accent_secondary"
+        android:fontFamily="sans-serif-medium"
+        android:visibility="gone"
+        android:paddingStart="16dp"
+        android:paddingBottom="2dp" />
+
+    <!-- Bubble container (gets background drawable) -->
+    <LinearLayout
+        android:id="@+id/chatBubble"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/tvChatMessage"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Message text"
+            android:textSize="14sp"
+            android:textColor="@color/text_primary"
+            android:fontFamily="sans-serif-light"
+            android:paddingHorizontal="14dp"
+            android:paddingVertical="8dp"
+            android:maxWidth="260dp"
+            android:autoLink="web"
+            android:linksClickable="true" />
+    </LinearLayout>
+
+    <!-- Timestamp -->
+    <TextView
+        android:id="@+id/tvChatTime"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="12:00"
+        android:textSize="10sp"
+        android:textColor="@color/text_hint"
+        android:fontFamily="sans-serif-light"
+        android:visibility="gone"
+        android:paddingTop="2dp" />
+</LinearLayout>

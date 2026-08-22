@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- === VIVID PURPLE ON OLED BLACK PALETTE === -->
+    <!-- Hero: Vivid Purple #9D00FF | Deep Indigo #341539 | Lavender #A47DAB -->
+
+    <!-- Surface — Pure OLED black with subtle purple tint -->
+    <color name="bg_dark">#000000</color>
+    <color name="bg_dark_secondary">#050508</color>
+    <color name="card_dark">#0F0A14</color>
+    <color name="card_dark_elevated">#1A1028</color>
+    <color name="surface_dark">#080510</color>
+
+    <!-- Typography — high contrast on black -->
+    <color name="text_primary">#F0E8F5</color>
+    <color name="text_secondary">#8A7A9A</color>
+    <color name="text_hint">#4A3A5A</color>
+
+    <!-- Brand Primary = Vivid Purple #9D00FF -->
+    <color name="accent_primary">#9D00FF</color>
+    <color name="accent_secondary">#A47DAB</color>
+    <color name="accent_primary_light">#B34DFF</color>
+    <color name="accent_dimmed">#1A9D00FF</color>
+    <color name="accent_glow">#209D00FF</color>
+    <color name="accent_border">#259D00FF</color>
+
+    <!-- Per-Screen Accents -->
+    <color name="stream_accent">#9D00FF</color>
+    <color name="receive_accent">#A47DAB</color>
+    <color name="duplex_accent">#B34DFF</color>
+    <color name="settings_accent">#A47DAB</color>
+    <color name="fileshare_accent">#FF8800</color>
+
+    <!-- Status -->
+    <color name="accent_green">#9D00FF</color>
+    <color name="accent_green_muted">#1A9D00FF</color>
+    <color name="accent_red">#FF3366</color>
+    <color name="accent_red_muted">#1AFF3366</color>
+    <color name="accent_orange">#FF6B35</color>
+    <color name="accent_pink">#FF3388</color>
+    <color name="accent_purple">#B34DFF</color>
+    <color name="accent_blue">#6B7FFF</color>
+    <color name="accent_cyan">#50E3C2</color>
+
+    <!-- Chat -->
+    <color name="chat_sent_bg">#1A0F2E</color>
+    <color name="chat_sent_border">#9D00FF</color>
+    <color name="chat_received_bg">#1A1028</color>
+    <color name="chat_system_bg">#0F0A14</color>
+
+    <!-- Inputs & Cards -->
+    <color name="input_bg">#0F0A14</color>
+    <color name="input_stroke">#1E103A</color>
+    <color name="divider_dark">#1E1030</color>
+    <color name="label_color">#4A3A5A</color>
+    <color name="now_playing_bg">#050508</color>
+
+    <!-- Media -->
+    <color name="media_button_bg">#0F0A14</color>
+    <color name="media_button_active">#9D00FF</color>
+
+    <!-- Navigation -->
+    <color name="nav_bg">#000000</color>
+    <color name="nav_indicator">#1E103A</color>
+    <color name="nav_active">#9D00FF</color>
+    <color name="nav_inactive">#4A3A5A</color>
+
+    <!-- Settings Card -->
+    <color name="settings_card_bg">#0F0A14</color>
+
+    <!-- Seekbar -->
+    <color name="seekbar_track">#1A1028</color>
+</resources>

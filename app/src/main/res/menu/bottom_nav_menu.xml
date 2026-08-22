@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:id="@+id/nav_stream"
+        android:icon="@drawable/ic_nav_stream"
+        android:title="Stream" />
+    <item
+        android:id="@+id/nav_receive"
+        android:icon="@drawable/ic_nav_receive"
+        android:title="Receive" />
+    <item
+        android:id="@+id/nav_duplex"
+        android:icon="@drawable/ic_nav_duplex"
+        android:title="Duplex" />
+    <item
+        android:id="@+id/nav_fileshare"
+        android:icon="@drawable/ic_nav_fileshare"
+        android:title="File Share" />
+    <item
+        android:id="@+id/nav_settings"
+        android:icon="@drawable/ic_nav_settings"
+        android:title="Settings" />
+</menu>
+

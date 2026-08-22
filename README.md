@@ -24,6 +24,16 @@
   <a href="#knowledge-graph">Knowledge graph</a>
 </p>
 
+
+### Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/stream.png" width="23%" alt="Stream Mode" />
+  <img src="docs/screenshots/receive.png" width="23%" alt="Receive Mode" />
+  <img src="docs/screenshots/duplex.png" width="23%" alt="Duplex Mode" />
+  <img src="docs/screenshots/FileShare.png" width="23%" alt="Fileshare" />
+</p>
+
 ---
 
 ## Features

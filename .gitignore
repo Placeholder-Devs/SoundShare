@@ -55,4 +55,6 @@ __pycache__/
 *.pyc
 
 # If you want to ignore all Graphify output instead, uncomment this:
-# graphify-out/
+graphify-out/*
+graphify-out/
+*.md

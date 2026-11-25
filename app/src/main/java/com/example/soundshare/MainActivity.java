@@ -22,6 +22,8 @@ import android.net.ConnectivityManager;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.Build;
@@ -81,6 +83,7 @@ import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -154,13 +157,14 @@ public class MainActivity extends AppCompatActivity
 
     // {sampleRate, channels, framesPerBuffer, bitsPerSample, compression, isFloat}
     private static final int[][] QUALITY_PRESETS = {
-            {44100, 1, 32, 16, 0, 0},
-            {44100, 2, 32, 16, 0, 0},
+            // fpb: presets 0/1 = 10 ms, presets 5/6 = 20 ms (header values only; layout unchanged)
+            {44100, 1, 441, 16, 0, 0},
+            {44100, 2, 441, 16, 0, 0},
             {48000, 2, 5000, 16, 0, 0},
             {48000, 2, 4800, 24, 0, 0},
             {48000, 2, 9600, 24, 0, 0},
-            {96000, 2, 192000, 24, 0, 0},
-            {192000, 2, 192000, 24, 0, 0},
+            {96000, 2, 1920, 24, 0, 0},
+            {192000, 2, 3840, 24, 0, 0},
     };
 
     // Protocol v2: 28 byte header
@@ -300,8 +304,8 @@ public class MainActivity extends AppCompatActivity
     private boolean isAppInForeground = true;
 
     // Capability detection
-    private HiResAudioHelper.Capabilities deviceCaps;
-    private int[] availablePresetIndices;
+    private volatile HiResAudioHelper.Capabilities deviceCaps; // written by the CapCheck thread
+    private volatile int[] availablePresetIndices;
 
     // Stats
     private final AtomicLong bytesSentThisSecond = new AtomicLong(0);
@@ -360,6 +364,42 @@ public class MainActivity extends AppCompatActivity
     private volatile ServerSocket fileShareServerSocket, syncControlServerSocket;
     private volatile Socket fileShareSocket, syncControlSocket;
     private volatile DatagramSocket discoverySocket;
+    private WifiManager.MulticastLock discoveryMulticastLock;   // M3: held while answering discovery
+
+    // ---- M3: LAN network tracking (FIX_PLAN #2) ----
+    /** Wi-Fi/Ethernet network, tracked even when it is not validated and not the default. */
+    private volatile Network lanNetwork;
+    private ConnectivityManager.NetworkCallback lanNetworkCallback;
+    private volatile boolean vpnHintShown = false;
+
+    // ---- M3: shared ping-channel writer (FIX_PLAN #17) ----
+    private volatile DataOutputStream pingOut;
+    private final Object pingWriteLock = new Object();
+    private static final int PING_READ_TIMEOUT_MS = 1000;
+    private static final long PING_IDLE_DROP_MS = 15_000;
+
+    // ---- M3: metadata broadcast throttling (FIX_PLAN #15) ----
+    private final java.util.concurrent.ExecutorService metaExecutor = newMetaExecutor();
+
+    /** One worker (FIFO, no pile-up); the idle thread exits after 30 s so nothing leaks. */
+    private static java.util.concurrent.ExecutorService newMetaExecutor() {
+        java.util.concurrent.ThreadPoolExecutor ex = new java.util.concurrent.ThreadPoolExecutor(
+                1, 1, 30, java.util.concurrent.TimeUnit.SECONDS,
+                new java.util.concurrent.LinkedBlockingQueue<>(), r -> {
+                    Thread t = new Thread(r, "MetaBroadcast");
+                    t.setDaemon(true);
+                    return t;
+                });
+        ex.allowCoreThreadTimeOut(true);
+        return ex;
+    }
+    private volatile String lastMetaKey;
+    private volatile long lastMetaSentMs;
+    private static final long META_REFRESH_MS = 15_000;
+    private static final int META_ART_MAX_SIDE = 512;
+    private static final int META_ART_JPEG_QUALITY = 80;
+    private static final int META_ART_MAX_BYTES = 1_500_000;
+
     private volatile DataOutputStream syncControlOut;
     private volatile android.media.MediaPlayer syncMediaPlayer;
     private volatile Runnable playbackUpdateRunnable;
@@ -388,6 +428,10 @@ public class MainActivity extends AppCompatActivity
                 case AudioReceiveService.BROADCAST_STOP:
                     if (isReceiving.get()) stopReceiving();
                     break;
+                case AudioCaptureService.BROADCAST_STOP:
+                    if (isStreaming.get()) stopStreaming();
+                    else if (isDuplexActive.get()) onDuplexStop();
+                    break;
                 case FileShareNotificationHelper.BROADCAST_FILE_PLAY_PAUSE:
                     onSyncPlayPause();
                     break;
@@ -399,6 +443,14 @@ public class MainActivity extends AppCompatActivity
                     break;
                 case FileShareNotificationHelper.BROADCAST_FILE_STOP:
                     stopFileShare();
+                    break;
+                case android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY:
+                    if (SettingsFragment.isAutoPauseOnHeadset(MainActivity.this)) {
+                        if (!isPaused.get() && (isStreaming.get() || isReceiving.get() || isDuplexActive.get())) {
+                            togglePlayPause();
+                            Toast.makeText(MainActivity.this, "Headphones disconnected — stream paused", Toast.LENGTH_SHORT).show();
+                        }
+                    }
                     break;
             }
         }
@@ -464,7 +516,10 @@ public class MainActivity extends AppCompatActivity
 
                     AudioCaptureService.setOnServiceReady(() -> {
                         mainHandler.post(() -> {
-                            if (isFinishing() || isDestroyed()) return;
+                            if (isFinishing() || isDestroyed()) {
+                                stopForegroundService(); // don't leave a zombie FGS (services F10c)
+                                return;
+                            }
                             try {
                                 mediaProjection = projectionManager.getMediaProjection(
                                         projectionResultCode, projectionResultData);
@@ -483,11 +538,9 @@ public class MainActivity extends AppCompatActivity
                         });
                     });
 
-                    Intent svc = new Intent(this, AudioCaptureService.class);
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        startForegroundService(svc);
-                    } else {
-                        startService(svc);
+                    if (!AudioCaptureService.start(this)) {   // deferred-stop guard (review M2)
+                        AudioCaptureService.setOnServiceReady(null);
+                        updateStatus("Could not start the capture service. Try again");
                     }
                 } else {
                     updateStatus("Screen capture permission denied");
@@ -515,6 +568,7 @@ public class MainActivity extends AppCompatActivity
                             try {
                                 duplexProjection = projectionManager.getMediaProjection(code, data);
                                 if (duplexProjection != null) {
+                                    registerDuplexProjectionCallback(duplexProjection);
                                     if ("host".equals(duplexPendingMode)) {
                                         startDuplexHostWithProjection();
                                     } else if ("join".equals(duplexPendingMode)) {
@@ -536,11 +590,10 @@ public class MainActivity extends AppCompatActivity
                         startDuplex.run();
                     } else {
                         AudioCaptureService.setOnServiceReady(startDuplex);
-                        Intent svc = new Intent(this, AudioCaptureService.class);
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            startForegroundService(svc);
-                        } else {
-                            startService(svc);
+                        if (!AudioCaptureService.start(this)) {   // deferred-stop guard (review M2)
+                            AudioCaptureService.setOnServiceReady(null);
+                            duplexFragment.updateStatus("Could not start the capture service. Try again");
+                            onDuplexStop();
                         }
                     }
                 } else {
@@ -566,52 +619,132 @@ public class MainActivity extends AppCompatActivity
 
     private void registerProjectionCallback() {
         if (mediaProjection == null) return;
-        mediaProjection.registerCallback(new MediaProjection.Callback() {
+        final MediaProjection proj = mediaProjection;
+        proj.registerCallback(new MediaProjection.Callback() {
             @Override
             public void onStop() {
                 mainHandler.post(() -> {
-                    if (!isFinishing()) {
-                        stopStreaming();
-                        updateStatus("Media projection stopped");
+                    if (isFinishing()) return;
+                    // releaseProjection(p) clears the field before p.stop(): a self-initiated
+                    // stop must not overwrite the real stop reason in the status line.
+                    if (mediaProjection != proj) return;
+                    boolean locked = isKeyguardLockedNow();
+                    PipelineLog.w("PROJ_STOP", "stream projection stopped by system, keyguardLocked=" + locked);
+                    String msg = projectionStoppedMessage(locked, "Media projection stopped");
+                    // Record it as the session's failure reason, otherwise the stream thread's finally
+                    // overwrites it with "Streaming stopped" (phase5 review M1).
+                    StreamSession cur = currentStreamSession.get();
+                    if (cur != null && cur.failReason == null) {
+                        // the finally prints "Stopped: <reason>", so drop the "Capture stopped: " prefix
+                        cur.failReason = msg.startsWith("Capture stopped: ")
+                                ? msg.substring("Capture stopped: ".length()) : msg;
                     }
+                    stopStreaming();
+                    updateStatus(msg);
                 });
             }
         }, mainHandler);
+    }
+
+    /** FIX_PLAN #10: the duplex projection was never monitored (services F9). */
+    private void registerDuplexProjectionCallback(final MediaProjection proj) {
+        if (proj == null) return;
+        try {
+            proj.registerCallback(new MediaProjection.Callback() {
+                @Override
+                public void onStop() {
+                    mainHandler.post(() -> {
+                        if (isFinishing()) return;
+                        // onDuplexStop() clears isDuplexActive before proj.stop(): skip our own stop.
+                        if (duplexProjection != proj || !isDuplexActive.get()) return;
+                        boolean locked = isKeyguardLockedNow();
+                        PipelineLog.w("PROJ_STOP", "duplex projection stopped by system, keyguardLocked=" + locked);
+                        onDuplexStop();
+                        final String msg = projectionStoppedMessage(locked, "Media projection stopped");
+                        // onDuplexStop() posts "Stopped — Ready…"; post after it so this reason stays
+                        // visible (phase5 review M1).
+                        mainHandler.post(() -> {
+                            if (duplexFragment != null && duplexFragment.isAdded()) {
+                                duplexFragment.updateStatus(msg);
+                            }
+                        });
+                    });
+                }
+            }, mainHandler);
+        } catch (Exception e) {
+            PipelineLog.e("PROJ_STOP", "duplex projection callback registration failed", e);
+        }
+    }
+
+    private boolean isKeyguardLockedNow() {
+        try {
+            android.app.KeyguardManager km = getSystemService(android.app.KeyguardManager.class);
+            return km != null && km.isKeyguardLocked();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Android 15 QPR1+ stops MediaProjection when the screen locks (no opt-out). */
+    private static String projectionStoppedMessage(boolean keyguardLocked, String generic) {
+        return keyguardLocked
+                ? "Capture stopped: Android 15+ stops audio capture when the screen locks. Keep the screen on while streaming."
+                : generic;
     }
 
     // ---------- LIFECYCLE ----------
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        appliedNightMode = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
         setContentView(R.layout.activity_main);
         enableMaxRefreshRate();
 
         projectionManager = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
         setupNotifications();
 
-        // Setup fragments
-        streamFragment = new StreamFragment();
-        receiveFragment = new ReceiveFragment();
-        settingsFragment = new SettingsFragment();
-        duplexFragment = new DuplexFragment();
-        fileShareFragment = new FileShareFragment();
+        // Setup fragments. After a recreation (process restore, theme-overlay change, a config
+        // change not in configChanges) super.onCreate() has already restored the previous
+        // fragments: reuse them by tag instead of adding a duplicate set (FIX_PLAN #11).
+        androidx.fragment.app.FragmentManager fm = getSupportFragmentManager();
+        final String[] fragTags = {"settings", "fileshare", "duplex", "receive", "stream"};
+        Fragment[] restored = new Fragment[fragTags.length];
+        if (savedInstanceState != null) {
+            for (int i = 0; i < fragTags.length; i++) restored[i] = fm.findFragmentByTag(fragTags[i]);
+        }
+        settingsFragment = restored[0] instanceof SettingsFragment
+                ? (SettingsFragment) restored[0] : new SettingsFragment();
+        fileShareFragment = restored[1] instanceof FileShareFragment
+                ? (FileShareFragment) restored[1] : new FileShareFragment();
+        duplexFragment = restored[2] instanceof DuplexFragment
+                ? (DuplexFragment) restored[2] : new DuplexFragment();
+        receiveFragment = restored[3] instanceof ReceiveFragment
+                ? (ReceiveFragment) restored[3] : new ReceiveFragment();
+        streamFragment = restored[4] instanceof StreamFragment
+                ? (StreamFragment) restored[4] : new StreamFragment();
+        Fragment[] allFrags = {settingsFragment, fileShareFragment, duplexFragment,
+                receiveFragment, streamFragment};
 
         // Setup bottom navigation
         bottomNav = findViewById(R.id.bottomNav);
 
-        // Add all fragments once (show/hide pattern preserves state)
-        getSupportFragmentManager().beginTransaction()
-                .add(R.id.fragmentContainer, settingsFragment, "settings")
-                .hide(settingsFragment)
-                .add(R.id.fragmentContainer, fileShareFragment, "fileshare")
-                .hide(fileShareFragment)
-                .add(R.id.fragmentContainer, duplexFragment, "duplex")
-                .hide(duplexFragment)
-                .add(R.id.fragmentContainer, receiveFragment, "receive")
-                .hide(receiveFragment)
-                .add(R.id.fragmentContainer, streamFragment, "stream")
-                .commit();
+        // Active tab: the restored fragment that was visible, otherwise Stream.
         activeFragment = streamFragment;
+        for (int i = 0; i < allFrags.length; i++) {
+            if (restored[i] == allFrags[i] && !allFrags[i].isHidden()) {
+                activeFragment = allFrags[i];
+                break;
+            }
+        }
+
+        // Add missing fragments once (show/hide pattern preserves state); exactly one is shown.
+        androidx.fragment.app.FragmentTransaction ft = fm.beginTransaction();
+        for (int i = 0; i < allFrags.length; i++) {
+            if (restored[i] != allFrags[i]) ft.add(R.id.fragmentContainer, allFrags[i], fragTags[i]);
+            if (allFrags[i] == activeFragment) ft.show(allFrags[i]);
+            else ft.hide(allFrags[i]);
+        }
+        ft.commit();
 
         bottomNav.setOnItemSelectedListener(item -> {
             int id = item.getItemId();
@@ -631,6 +764,18 @@ public class MainActivity extends AppCompatActivity
             }
             return target != null;
         });
+        // Keep the bottom nav in sync with the restored visible tab (listener is a no-op here
+        // because target == activeFragment).
+        if (activeFragment != streamFragment) {
+            int navId = activeFragment == receiveFragment ? R.id.nav_receive
+                    : activeFragment == duplexFragment ? R.id.nav_duplex
+                    : activeFragment == fileShareFragment ? R.id.nav_fileshare
+                    : R.id.nav_settings;
+            bottomNav.setSelectedItemId(navId);
+        }
+
+        // Track Wi-Fi/Ethernet LAN network for socket binding and IP display (FIX_PLAN #2, M3).
+        registerLanNetworkCallback();
 
         // Detect capabilities and device IP
         setupQualitySpinner();
@@ -645,10 +790,12 @@ public class MainActivity extends AppCompatActivity
         mediaFilter.addAction(AudioCaptureService.BROADCAST_TOGGLE);
         mediaFilter.addAction(AudioCaptureService.BROADCAST_SKIP_NEXT);
         mediaFilter.addAction(AudioCaptureService.BROADCAST_SKIP_PREV);
+        mediaFilter.addAction(AudioCaptureService.BROADCAST_STOP);
         mediaFilter.addAction(FileShareNotificationHelper.BROADCAST_FILE_PLAY_PAUSE);
         mediaFilter.addAction(FileShareNotificationHelper.BROADCAST_FILE_NEXT);
         mediaFilter.addAction(FileShareNotificationHelper.BROADCAST_FILE_PREV);
         mediaFilter.addAction(FileShareNotificationHelper.BROADCAST_FILE_STOP);
+        mediaFilter.addAction(android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY);
         ContextCompat.registerReceiver(this, mediaControlReceiver, mediaFilter, ContextCompat.RECEIVER_NOT_EXPORTED);
 
         fileShareNotifHelper = new FileShareNotificationHelper(this);
@@ -656,8 +803,11 @@ public class MainActivity extends AppCompatActivity
         // Check NotificationListener permission and prompt if needed
         checkNotificationListenerPermission();
 
-        // Request storage permission for album art access
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        // Request storage permission for album art access. Fresh start only (not after a
+        // recreation); the result (code 4001) is handled silently in onRequestPermissionsResult.
+        if (savedInstanceState != null) {
+            Log.d(TAG, "Recreated: skipping storage permission prompt");
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this,
                     android.Manifest.permission.READ_MEDIA_AUDIO)
                     != PackageManager.PERMISSION_GRANTED) {
@@ -672,6 +822,51 @@ public class MainActivity extends AppCompatActivity
                         new String[]{android.Manifest.permission.READ_EXTERNAL_STORAGE}, 4001);
             }
         }
+
+        SettingsFragment.setOnSettingsChangedListener(key -> {
+            if (SettingsFragment.KEY_KEEP_SCREEN_ON.equals(key) || "reset".equals(key)) {
+                runOnUiThread(() -> {
+                    if (isFinishing() || isDestroyed()) return;
+                    applyKeepScreenOn(isStreaming.get() || isDuplexActive.get());
+                });
+            }
+        });
+    }
+
+    /**
+     * FLAG_KEEP_SCREEN_ON = user setting OR (API 35+ and a capture session is active).
+     * Android 15 QPR1+ stops MediaProjection when the screen locks (FIX_PLAN #10, R8), so
+     * the screen is kept on while Stream/Duplex capture runs. Call on the UI thread.
+     */
+    private void applyKeepScreenOn(boolean captureActive) {
+        boolean keep = SettingsFragment.isKeepScreenOn(this)
+                || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM && captureActive);
+        if (keep) {
+            getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
+    }
+
+    private int getAudioPerformanceMode() {
+        int mode = SettingsFragment.getPerfMode(this);
+        if (mode == 1) return AudioTrack.PERFORMANCE_MODE_NONE;
+        if (mode == 2) return AudioTrack.PERFORMANCE_MODE_POWER_SAVING;
+        return AudioTrack.PERFORMANCE_MODE_LOW_LATENCY;
+    }
+
+    private int getCalculatedBufferSize(int defaultMinBuf) {
+        // Legacy callers (duplex: 16-bit stereo) — 4 bytes/frame
+        return getCalculatedBufferSize(defaultMinBuf, 4);
+    }
+
+    private int getCalculatedBufferSize(int defaultMinBuf, int bytesPerFrame) {
+        int userFrames = SettingsFragment.getBufferSize(this);
+        return AudioPipelineUtils.userBufferBytes(userFrames, bytesPerFrame, defaultMinBuf);
+    }
+
+    private int getActiveStreamPort() {
+        return SettingsFragment.getCustomStreamPort(this);
     }
 
     private void enableMaxRefreshRate() {
@@ -705,11 +900,16 @@ public class MainActivity extends AppCompatActivity
         }
     }
 
+    /** The Notification Access prompt is shown at most once per process (not on every onCreate). */
+    private static boolean nlPromptShownThisProcess = false;
+
     private void checkNotificationListenerPermission() {
         String pkgName = getPackageName();
         java.util.Set<String> enabled = androidx.core.app.NotificationManagerCompat
                 .getEnabledListenerPackages(this);
         if (enabled.contains(pkgName)) return; // Already granted
+        if (nlPromptShownThisProcess) return;  // "Later" (or dismissed) is remembered for this session
+        nlPromptShownThisProcess = true;
 
         new android.app.AlertDialog.Builder(this)
                 .setTitle("🎵 Notification Access Required")
@@ -758,9 +958,52 @@ public class MainActivity extends AppCompatActivity
     @Override
     public void onConfigurationChanged(@NonNull Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
+        // uiMode is in configChanges so a dark/light switch can't kill a running session (FIX_PLAN #11).
+        // When nothing is running or stopping, re-theme by recreating (fragments are reused by tag),
+        // so the UI doesn't keep stale colors until restart (phase5 review services L4).
+        int night = newConfig.uiMode & Configuration.UI_MODE_NIGHT_MASK;
+        if (night != appliedNightMode) {
+            if (activeOtherMode(null) == null && !isFinishing()) {
+                appliedNightMode = night;
+                recreate();
+            }
+            // else: keep the old colors for now; the next idle change or restart re-themes
+        }
     }
 
+    /** Night bits of the configuration the current views were inflated with. */
+    private int appliedNightMode = -1;
+
     // ===== FRAGMENT CALLBACK IMPLEMENTATIONS =====
+
+    private static final int REQ_POST_NOTIFICATIONS = 3001;
+    private static final int REQ_STORAGE = 4001;
+    /** Start flow to resume after a REQ_AUDIO grant: "stream", "duplex_host", "duplex_join" or null. */
+    private String pendingAudioPermAction;
+    private String pendingDuplexJoinIp;
+    /** POST_NOTIFICATIONS is asked at most once per process and never blocks the start (FIX_PLAN #7). */
+    private static boolean notifPermAskedThisProcess = false;
+
+    /** Display name of an active mode other than {@code self}, or null (FIX_PLAN #23). */
+    private String activeOtherMode(String self) {
+        // A stopped session's finally still resets shared state (discovery, capture FGS, UI) until it
+        // ends, so a mode counts as busy while it is stopping too (phase5 review M2). A Stream restart
+        // is also refused while the old stream is stopping (its finally would stop the new capture FGS);
+        // a Receive restart is session-safe.
+        boolean streamStopping = !isStreaming.get() && currentStreamSession.get() != null;
+        if ((!"Stream".equals(self) && isStreaming.get()) || streamStopping) return "Stream";
+        if (!"Receive".equals(self) && (isReceiving.get() || currentReceiveSession.get() != null)) return "Receive";
+        if (!"Duplex".equals(self) && isDuplexActive.get()) return "Duplex";
+        if (!"File Share".equals(self) && isFileShareActive.get()) return "File Share";
+        return null;
+    }
+
+    private String modeBusyMessage(String other) {
+        boolean stopping = ("Stream".equals(other) && !isStreaming.get())
+                || ("Receive".equals(other) && !isReceiving.get());
+        if (stopping) return other + " is still stopping. Try again in a moment";
+        return other + " is active. Stop " + other + " first (only one mode can run at a time)";
+    }
 
     @Override
     public void onStartStreaming() {
@@ -768,21 +1011,43 @@ public class MainActivity extends AppCompatActivity
             stopStreaming();
             return;
         }
-        if (!hasRecordAudioPermission()) {
-            ActivityCompat.requestPermissions(this,
-                    new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
+        String other = activeOtherMode("Stream");
+        if (other != null) {
+            updateStatus(modeBusyMessage(other));
             return;
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this,
-                    Manifest.permission.POST_NOTIFICATIONS)
-                    != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this,
-                        new String[]{Manifest.permission.POST_NOTIFICATIONS}, 3001);
-                return;
-            }
+        if (!hasRecordAudioPermission()) {
+            pendingAudioPermAction = "stream";
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
+            return; // continues in onRequestPermissionsResult (no "tap again")
         }
-        captureResultLauncher.launch(projectionManager.createScreenCaptureIntent());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && !notifPermAskedThisProcess
+                && ContextCompat.checkSelfPermission(this,
+                        Manifest.permission.POST_NOTIFICATIONS)
+                        != PackageManager.PERMISSION_GRANTED) {
+            notifPermAskedThisProcess = true;
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_POST_NOTIFICATIONS);
+            return; // continues to capture consent in onRequestPermissionsResult, granted or not
+        }
+        launchStreamCaptureConsent();
+    }
+
+    private void launchStreamCaptureConsent() {
+        if (isStreaming.get()) return;
+        String other = activeOtherMode("Stream");
+        if (other != null) {
+            updateStatus(modeBusyMessage(other));
+            return;
+        }
+        try {
+            captureResultLauncher.launch(projectionManager.createScreenCaptureIntent());
+        } catch (Exception e) {
+            Log.e(TAG, "Cannot launch screen capture consent", e);
+            updateStatus("Cannot request screen capture: " + e.getMessage());
+        }
     }
 
     @Override
@@ -805,6 +1070,13 @@ public class MainActivity extends AppCompatActivity
             updateStatus("Enter streamer IP address");
             return;
         }
+        String other = activeOtherMode("Receive");
+        if (other != null) {
+            updateStatus(modeBusyMessage(other));
+            return;
+        }
+        // One-time hint to exempt SoundShare from battery optimization (FIX_PLAN #31, M6 helper).
+        BatteryOptHelper.maybeShowHint(this);
         startReceiving(ip);
     }
 
@@ -843,6 +1115,16 @@ public class MainActivity extends AppCompatActivity
         if (!cachedDeviceIp.equals("Not connected") && !cachedDeviceIp.equals("Loading...")) {
             copyToClipboard(cachedDeviceIp);
         }
+    }
+
+    /** DuplexFragment.setActive() hook: keep the screen on while Duplex captures (API 35+). */
+    @Override
+    public void onDuplexActiveChanged(boolean active) {
+        if (isFinishing() || isDestroyed()) return;
+        runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            applyKeepScreenOn(isStreaming.get() || (active && isDuplexActive.get()));
+        });
     }
 
     private void setupSpinnerForFragment(Spinner spinner) {
@@ -915,11 +1197,21 @@ public class MainActivity extends AppCompatActivity
                 filteredNames.toArray(new String[0]));
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinner.setAdapter(adapter);
-        int defaultPos = 0;
+        // Keep the user's current preset if it survived the filter, else Balanced (2).
+        int defaultPos = -1;
+        int keep = selectedPreset;
         for (int i = 0; i < availablePresetIndices.length; i++) {
-            if (availablePresetIndices[i] == 2) { defaultPos = i; break; }
+            if (availablePresetIndices[i] == keep) { defaultPos = i; break; }
         }
-        spinner.setSelection(Math.min(defaultPos, filteredNames.size() - 1));
+        if (defaultPos < 0) {
+            defaultPos = 0;
+            for (int i = 0; i < availablePresetIndices.length; i++) {
+                if (availablePresetIndices[i] == 2) { defaultPos = i; break; }
+            }
+        }
+        if (!filteredNames.isEmpty()) {
+            spinner.setSelection(Math.min(defaultPos, filteredNames.size() - 1));
+        }
     }
 
     // ===== SMART QUALITY SPINNER =====
@@ -935,9 +1227,12 @@ public class MainActivity extends AppCompatActivity
             Log.i(TAG, "Audio caps: " + deviceCaps);
             runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed()) return;
-                // Update spinner in the stream fragment if visible
-                if (streamFragment != null && streamFragment.isAdded()) {
-                    // Fragment will request spinner setup via callback
+                // Caps usually arrive after StreamFragment set up its spinner (deviceCaps was
+                // still null then), so re-filter it now (FIX_PLAN #22). Not while streaming:
+                // the running session already uses its preset.
+                if (streamFragment != null && streamFragment.isAdded() && !isStreaming.get()) {
+                    Spinner qs = streamFragment.getQualitySpinner();
+                    if (qs != null) filterPresetsForSpinner(qs);
                 }
                 showDeviceCapabilities();
             });
@@ -964,27 +1259,45 @@ public class MainActivity extends AppCompatActivity
     private void togglePlayPause() {
         if (isReceiving.get()) {
             AudioTrack at = audioTrack;
-            if (at == null) return;
             if (isPaused.get()) {
-                at.play();
                 isPaused.set(false);
+                if (at != null) {
+                    try {
+                        at.flush();
+                        at.play();
+                    } catch (Exception ignored) {}
+                }
                 updatePlayPauseButton(false);
                 updateNowPlayingState("Live", R.color.accent_green);
                 sendControlMessage(CTRL_RESUME);
+                // No local media-key fallback here: the receiver controls the host only over
+                // the network (a local key would loop back into our own session — FIX_PLAN #9)
                 updateReceiverNotification();
             } else {
-                at.pause();
                 isPaused.set(true);
+                if (at != null) {
+                    try {
+                        at.pause();
+                    } catch (Exception ignored) {}
+                }
                 updatePlayPauseButton(true);
                 updateNowPlayingState("Paused", R.color.accent_orange);
                 sendControlMessage(CTRL_PAUSE);
                 updateReceiverNotification();
             }
         } else if (isStreaming.get()) {
-            AudioRecord ar = recorder;
-            if (ar == null) return;
             if (isPaused.get()) {
-                ar.startRecording();
+                // A remote CTRL_PAUSE stops the AudioRecord; a local resume must restart it
+                AudioRecord ar = recorder;
+                if (ar != null) {
+                    try {
+                        if (ar.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
+                            ar.startRecording();
+                        }
+                    } catch (IllegalStateException e) {
+                        Log.w(TAG, "Recorder restart on resume failed", e);
+                    }
+                }
                 isPaused.set(false);
                 updatePlayPauseButton(false);
                 updateNowPlayingState("Live", R.color.accent_green);
@@ -992,7 +1305,6 @@ public class MainActivity extends AppCompatActivity
                 broadcastControlToClients(CTRL_RESUME);
                 MediaMetadataHelper.sendPlay(this);
             } else {
-                ar.stop();
                 isPaused.set(true);
                 updatePlayPauseButton(true);
                 updateNowPlayingState("Paused", R.color.accent_orange);
@@ -1004,15 +1316,26 @@ public class MainActivity extends AppCompatActivity
             if (isPaused.get()) {
                 isPaused.set(false);
                 AudioTrack dt = duplexTrack;
-                if (dt != null) { try { dt.play(); } catch (Exception ignored) {} }
+                if (dt != null) {
+                    try {
+                        dt.flush();
+                        dt.play();
+                    } catch (Exception ignored) {}
+                }
+                updatePlayPauseButton(false);
                 sendDuplexControlMessage(CTRL_RESUME);
-                MediaMetadataHelper.sendPlay(this);
+                MediaMetadataHelper.sendPlay(this, false); // no media-key fallback (FIX_PLAN #9)
             } else {
                 isPaused.set(true);
                 AudioTrack dt = duplexTrack;
-                if (dt != null) { try { dt.pause(); } catch (Exception ignored) {} }
+                if (dt != null) {
+                    try {
+                        dt.pause();
+                    } catch (Exception ignored) {}
+                }
+                updatePlayPauseButton(true);
                 sendDuplexControlMessage(CTRL_PAUSE);
-                MediaMetadataHelper.sendPause(this);
+                MediaMetadataHelper.sendPause(this, false); // no media-key fallback (FIX_PLAN #9)
             }
             // Always update notification with current state
             updateDuplexNotificationNow();
@@ -1054,8 +1377,11 @@ public class MainActivity extends AppCompatActivity
         if (ps == null || ps.isClosed()) return;
         new Thread(() -> {
             try {
-                DataOutputStream dout = new DataOutputStream(ps.getOutputStream());
-                synchronized (dout) {
+                // Shared writer + lock with the ping thread, so a CTRL byte can never land
+                // between LATENCY_REPORT and its 8-byte value (FIX_PLAN #17).
+                synchronized (pingWriteLock) {
+                    DataOutputStream dout = pingOut;
+                    if (dout == null) return;
                     dout.writeByte(ctrl);
                     dout.flush();
                 }
@@ -1078,6 +1404,7 @@ public class MainActivity extends AppCompatActivity
                     } catch (IOException e) {
                         cc.close();
                         chatClients.remove(cc);
+                        lastMetaKey = null;   // push metadata to a joining/replacing client now (phase5 review L1)
                     }
                 }
             }
@@ -1096,50 +1423,68 @@ public class MainActivity extends AppCompatActivity
         String album = media.album != null ? media.album : "";
         long durationMs = media.durationMs;
         long positionMs = media.positionMs;
+        final Bitmap srcArt = media.albumArt;
 
-        // Send HIGH QUALITY album art — 1024px JPEG quality 95
-        // JPEG at 95 quality stays under 500KB while looking sharp
-        byte[] artBytes = null;
-        if (media.albumArt != null) {
-            try {
-                int origW = media.albumArt.getWidth();
-                int origH = media.albumArt.getHeight();
-                Bitmap toSend;
+        // FIX_PLAN #15: send only when the track/art or the set of chat clients changes,
+        // otherwise refresh at most every 15 s (was: a full-size q95 JPEG every second).
+        int clientCount = 0;
+        for (ChatClient cc : chatClients) if (cc.connected.get()) clientCount++;
+        if (clientCount == 0) return;
+        String key = title + '\u0000' + artist + '\u0000' + album + '\u0000'
+                + (srcArt == null ? "-" : srcArt.getWidth() + "x" + srcArt.getHeight())
+                + '\u0000' + clientCount;
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (key.equals(lastMetaKey) && now - lastMetaSentMs < META_REFRESH_MS) return;
+        lastMetaKey = key;
+        lastMetaSentMs = now;
 
-                if (origW >= 1024 && origH >= 1024) {
-                    // Already large — scale to exactly 1024 to control size
-                    toSend = Bitmap.createScaledBitmap(
-                            media.albumArt, 1024, 1024, true);
-                } else if (origW >= 512) {
-                    // Medium — send at original size
-                    toSend = media.albumArt;
-                } else {
-                    // Small — scale up to 512
-                    toSend = Bitmap.createScaledBitmap(
-                            media.albumArt, 512, 512, true);
-                }
-
-                java.io.ByteArrayOutputStream bos =
-                        new java.io.ByteArrayOutputStream();
-                toSend.compress(Bitmap.CompressFormat.JPEG, 95, bos);
-                artBytes = bos.toByteArray();
-            } catch (Exception ignored) {}
-        }
-        final byte[] art = artBytes;
-
-        new Thread(() -> {
-            for (ChatClient cc : chatClients) {
-                if (cc.connected.get()) {
-                    try {
-                        writeMetadataMessage(cc.out, title, artist, album,
-                                art, durationMs, positionMs);
-                    } catch (IOException e) {
-                        cc.close();
-                        chatClients.remove(cc);
+        // Encode + write on ONE background thread (no UI-thread JPEG, no thread pile-up).
+        try {
+            metaExecutor.execute(() -> {
+                byte[] art = encodeMetadataArt(srcArt);
+                for (ChatClient cc : chatClients) {
+                    if (cc.connected.get()) {
+                        try {
+                            writeMetadataMessage(cc.out, title, artist, album,
+                                    art, durationMs, positionMs);
+                        } catch (IOException e) {
+                            cc.close();
+                            chatClients.remove(cc);
+                            lastMetaKey = null;   // push metadata to a joining/replacing client now (phase5 review L1)
+                        }
                     }
                 }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+        }
+    }
+
+    /**
+     * Album art for CHAT_METADATA: longest side ≤ 512 px (aspect kept, never upscaled),
+     * JPEG q80 — typically 20-60 KB, always below the receivers' 1.5 MB limit.
+     * Returns null (sent as artLen 0) when there is no art or encoding fails.
+     */
+    private static byte[] encodeMetadataArt(Bitmap src) {
+        if (src == null) return null;
+        try {
+            int w = src.getWidth(), h = src.getHeight();
+            if (w <= 0 || h <= 0) return null;
+            Bitmap toSend = src;
+            int longest = Math.max(w, h);
+            if (longest > META_ART_MAX_SIDE) {
+                float scale = META_ART_MAX_SIDE / (float) longest;
+                int nw = Math.max(1, Math.round(w * scale));
+                int nh = Math.max(1, Math.round(h * scale));
+                toSend = Bitmap.createScaledBitmap(src, nw, nh, true);
             }
-        }, "MetaBroadcast").start();
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            toSend.compress(Bitmap.CompressFormat.JPEG, META_ART_JPEG_QUALITY, bos);
+            if (toSend != src) toSend.recycle();
+            byte[] out = bos.toByteArray();
+            return out.length < META_ART_MAX_BYTES ? out : null;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private void writeMetadataMessage(DataOutputStream out, String title,
@@ -1177,6 +1522,9 @@ public class MainActivity extends AppCompatActivity
             }
             if (isReceiving.get() && receiveFragment != null && receiveFragment.isAdded()) {
                 receiveFragment.setPlayPauseIcon(paused);
+            }
+            if (isDuplexActive.get() && duplexFragment != null && duplexFragment.isAdded()) {
+                duplexFragment.setPlayPauseIcon(paused);
             }
         });
     }
@@ -1238,6 +1586,8 @@ public class MainActivity extends AppCompatActivity
         showDeviceIp();
         isAppInForeground = true;
         if (notificationHelper != null) notificationHelper.setAppInForeground(true);
+
+        applyKeepScreenOn(isStreaming.get() || isDuplexActive.get());
     }
 
     @Override
@@ -1251,6 +1601,7 @@ public class MainActivity extends AppCompatActivity
     protected void onDestroy() {
         super.onDestroy();
         try { unregisterReceiver(mediaControlReceiver); } catch (Exception ignored) {}
+        unregisterLanNetworkCallback(); // FIX_PLAN #2 (M3 helper)
         stopStreaming();
         stopReceiving();
         onDuplexStop();
@@ -1271,27 +1622,53 @@ public class MainActivity extends AppCompatActivity
     public void onRequestPermissionsResult(int req, @NonNull String[] perms,
                                            @NonNull int[] results) {
         super.onRequestPermissionsResult(req, perms, results);
-        if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED)
-            updateStatus("Permission granted. Tap again.");
-        else updateStatus("Permission denied");
+        boolean granted = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
+        if (req == REQ_AUDIO) {
+            String action = pendingAudioPermAction;
+            String joinIp = pendingDuplexJoinIp;
+            pendingAudioPermAction = null;
+            pendingDuplexJoinIp = null;
+            if (granted || hasRecordAudioPermission()) {
+                // Continue the flow the user started; no "tap again".
+                if ("stream".equals(action)) onStartStreaming();
+                else if ("duplex_host".equals(action)) onDuplexHost();
+                else if ("duplex_join".equals(action) && joinIp != null) onDuplexJoin(joinIp);
+                return;
+            }
+            boolean permanent = results.length > 0 && !ActivityCompat
+                    .shouldShowRequestPermissionRationale(this, Manifest.permission.RECORD_AUDIO);
+            String msg = results.length == 0
+                    ? "Permission request was interrupted. Tap Start again"
+                    : permanent
+                    ? "Audio permission denied. Enable it in Settings > Apps > SoundShare > Permissions"
+                    : "Audio permission denied. It is required to capture audio";
+            if (action != null && action.startsWith("duplex")
+                    && duplexFragment != null && duplexFragment.isAdded()) {
+                duplexFragment.updateStatus(msg);
+            } else {
+                updateStatus(msg);
+            }
+        } else if (req == REQ_POST_NOTIFICATIONS) {
+            // Optional: the foreground service runs without it. Never block the stream start.
+            if (!granted) Log.i(TAG, "POST_NOTIFICATIONS not granted; continuing without it");
+            launchStreamCaptureConsent();
+        } else if (req == REQ_STORAGE) {
+            // Album-art storage access is optional: log only, never touch the stream status.
+            Log.i(TAG, "Storage/media permission " + (granted ? "granted" : "not granted"));
+        }
     }
 
     // ---------- PROTOCOL HEADER (v2 - 28 bytes) ----------
     private void writeFormatHeader(OutputStream out, AudioConfig config) throws IOException {
-        byte[] header = new byte[HEADER_SIZE];
-        ByteBuffer buf = ByteBuffer.wrap(header);
-        buf.putInt(HEADER_MAGIC);                          // 0-3
-        buf.putInt(HEADER_VERSION);                        // 4-7
-        buf.putInt(config.sampleRate);                     // 8-11
-        buf.putShort((short) config.bitsPerSample);       // 12-13
-        buf.putShort((short) config.channels);            // 14-15
-        buf.putInt(config.framesPerBuffer);                // 16-19
-        buf.putInt(config.chunkSize);                      // 20-23
-        buf.putShort((short) config.compressionType);     // 24-25
-        buf.put((byte) (config.isFloat ? 1 : 0));          // 26
-        buf.put((byte) 0);                                 // 27 reserved
+        // Byte-identical 28-byte v2 header (see AudioPipelineUtils.encodeHeaderV2)
+        byte[] header = AudioPipelineUtils.encodeHeaderV2(config.sampleRate, config.bitsPerSample,
+                config.channels, config.framesPerBuffer, config.chunkSize,
+                config.compressionType, config.isFloat);
         out.write(header);
         out.flush();
+        PipelineLog.i("HDR_TX", String.format(Locale.US, "%dHz %dbit %dch fpb=%d chunk=%d",
+                config.sampleRate, config.bitsPerSample, config.channels,
+                config.framesPerBuffer, config.chunkSize));
     }
 
     private AudioConfig readFormatHeader(InputStream in) throws IOException {
@@ -1326,11 +1703,22 @@ public class MainActivity extends AppCompatActivity
             return null;
         }
 
+        int safeFpb = AudioPipelineUtils.sanitizeFramesPerBuffer(fpb, sr);
+        if (safeFpb != fpb) {
+            PipelineLog.w("HDR_RX", "Bogus framesPerBuffer " + fpb + " → " + safeFpb);
+        }
+        if (version != HEADER_VERSION) {
+            PipelineLog.w("HDR_RX", "Unexpected header version " + version + " (expected "
+                    + HEADER_VERSION + "), continuing");
+        }
         Log.i(TAG, String.format(Locale.US,
                 "Header: v%d %dHz %dch %dbit comp=%d float=%d",
                 version, sr, ch, bps, comp, floatFlag));
+        PipelineLog.i("HDR_RX", String.format(Locale.US,
+                "v%d %dHz %dch %dbit fpb=%d comp=%d float=%d",
+                version, sr, ch, bps, safeFpb, comp, floatFlag));
 
-        return AudioConfig.fromHeader(sr, ch, fpb, bps, comp, floatFlag);
+        return AudioConfig.fromHeader(sr, ch, safeFpb, bps, comp, floatFlag);
     }
 
     private boolean isValidSampleRate(int sr) {
@@ -1351,49 +1739,231 @@ public class MainActivity extends AppCompatActivity
             if (fileShareFragment != null && fileShareFragment.isAdded()) {
                 fileShareFragment.setDeviceIp(cachedDeviceIp);
             }
+            maybeShowVpnHint();
         });
     }
 
-    @SuppressLint("deprecation")
+    /** One-time hint when a VPN is the active network (LAN traffic may be tunnelled or blocked). */
+    private void maybeShowVpnHint() {
+        if (vpnHintShown || isFinishing() || isDestroyed()) return;
+        try {
+            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            if (cm == null) return;
+            Network active = cm.getActiveNetwork();
+            if (active == null) return;
+            NetworkCapabilities nc = cm.getNetworkCapabilities(active);
+            if (nc == null || !nc.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return;
+            boolean visible = (streamFragment != null && streamFragment.isAdded())
+                    || (receiveFragment != null && receiveFragment.isAdded());
+            if (!visible) return;   // try again on the next refresh
+            vpnHintShown = true;
+            PipelineLog.w("NET_LAN", "VPN is the active network");
+            updateStatus("VPN active — LAN streaming may be blocked. "
+                    + "Exclude SoundShare or allow LAN access in the VPN app.");
+        } catch (Exception e) {
+            PipelineLog.w("NET_LAN", "VPN check failed: " + e);
+        }
+    }
+
+    /**
+     * The IP other devices on the LAN should use to reach this phone.
+     * 1) IPv4 of the tracked Wi-Fi/Ethernet network (even if unvalidated / not default);
+     * 2) else an interface walk (up, non-loopback) ranked by NetUtils (wlan/ap/... first,
+     *    cellular/VPN/CLAT dropped) — covers the phone-as-hotspot case;
+     * 3) else "Not connected".
+     * Previously this used getActiveNetwork(), which shows the cellular or VPN address
+     * whenever Wi-Fi isn't the default network (FIX_PLAN R1 / #2).
+     */
     private String getDeviceIpAddress() {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Network lan = lanNetwork;
+            if (lan != null) {
                 ConnectivityManager cm = getSystemService(ConnectivityManager.class);
-                if (cm != null) {
-                    Network net = cm.getActiveNetwork();
-                    if (net != null) {
-                        LinkProperties props = cm.getLinkProperties(net);
-                        if (props != null) {
-                            for (LinkAddress la : props.getLinkAddresses()) {
-                                InetAddress a = la.getAddress();
-                                if (a instanceof Inet4Address && !a.isLoopbackAddress()) {
-                                    String h = a.getHostAddress();
-                                    if (h != null) return h;
-                                }
-                            }
+                LinkProperties props = cm != null ? cm.getLinkProperties(lan) : null;
+                if (props != null) {
+                    for (LinkAddress la : props.getLinkAddresses()) {
+                        InetAddress a = la.getAddress();
+                        if (a instanceof Inet4Address && !a.isLoopbackAddress()
+                                && !a.isLinkLocalAddress()) {
+                            String h = a.getHostAddress();
+                            if (h != null) return h;
                         }
                     }
                 }
             }
-            WifiManager wm = (WifiManager) getApplicationContext()
-                    .getSystemService(Context.WIFI_SERVICE);
-            if (wm != null) {
-                int ipInt = wm.getConnectionInfo().getIpAddress();
-                if (ipInt != 0)
-                    return String.format(Locale.US, "%d.%d.%d.%d",
-                            ipInt & 0xff, (ipInt >> 8) & 0xff,
-                            (ipInt >> 16) & 0xff, (ipInt >> 24) & 0xff);
-            }
-            for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces()))
-                for (InetAddress a : Collections.list(ni.getInetAddresses()))
-                    if (!a.isLoopbackAddress() && a instanceof Inet4Address) {
-                        String h = a.getHostAddress();
-                        if (h != null) return h;
-                    }
         } catch (Exception e) {
-            Log.e(TAG, "IP error", e);
+            PipelineLog.w("NET_LAN", "LAN LinkProperties read failed: " + e);
+        }
+        try {
+            List<NetUtils.Candidate> cands = new ArrayList<>();
+            java.util.Enumeration<NetworkInterface> ifs = NetworkInterface.getNetworkInterfaces();
+            if (ifs != null) {
+                for (NetworkInterface ni : Collections.list(ifs)) {
+                    try {
+                        if (!ni.isUp() || ni.isLoopback()) continue;
+                    } catch (Exception ignored) {
+                        continue;
+                    }
+                    for (InetAddress a : Collections.list(ni.getInetAddresses())) {
+                        if (a instanceof Inet4Address && !a.isLoopbackAddress()) {
+                            String h = a.getHostAddress();
+                            if (h != null) cands.add(new NetUtils.Candidate(ni.getName(), h));
+                        }
+                    }
+                }
+            }
+            List<String> ranked = NetUtils.rankIpv4Candidates(cands);
+            if (!ranked.isEmpty()) return ranked.get(0);
+        } catch (Exception e) {
+            PipelineLog.w("NET_LAN", "Interface walk failed: " + e);
         }
         return "Not connected";
+    }
+
+    // ---------- LAN network tracking (FIX_PLAN #2, M3) ----------
+    private final java.util.Set<Network> lanNetworks =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+
+    /**
+     * Tracks Wi-Fi/Ethernet networks WITHOUT requiring INTERNET/VALIDATED, so LAN sockets can be
+     * bound to Wi-Fi even when cellular stays the default (no-internet Wi-Fi, OEM "smart switch").
+     * Called from onCreate (M5).
+     */
+    private void registerLanNetworkCallback() {
+        if (lanNetworkCallback != null) return;
+        ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+        if (cm == null) return;
+        NetworkRequest req = new NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build();
+        ConnectivityManager.NetworkCallback cb = new ConnectivityManager.NetworkCallback() {
+            @Override public void onAvailable(@NonNull Network n) {
+                lanNetworks.add(n);
+                lanNetwork = n;
+                PipelineLog.i("NET_LAN", "LAN network available");
+                mainHandler.post(MainActivity.this::showDeviceIp);
+            }
+
+            @Override public void onLost(@NonNull Network n) {
+                lanNetworks.remove(n);
+                if (n.equals(lanNetwork)) {
+                    java.util.Iterator<Network> it = lanNetworks.iterator();
+                    lanNetwork = it.hasNext() ? it.next() : null;
+                }
+                PipelineLog.i("NET_LAN", "LAN network lost; "
+                        + (lanNetwork != null ? "another LAN network remains" : "no LAN network"));
+                mainHandler.post(MainActivity.this::showDeviceIp);
+            }
+
+            @Override public void onLinkPropertiesChanged(@NonNull Network n,
+                                                          @NonNull LinkProperties lp) {
+                if (n.equals(lanNetwork)) mainHandler.post(MainActivity.this::showDeviceIp);
+            }
+        };
+        try {
+            cm.registerNetworkCallback(req, cb);
+            lanNetworkCallback = cb;
+        } catch (Exception e) {
+            // SecurityException / TooManyRequestsException: fall back to unbound sockets.
+            PipelineLog.e("NET_LAN", "registerNetworkCallback failed", e);
+        }
+    }
+
+    /** Called from onDestroy (M5). */
+    private void unregisterLanNetworkCallback() {
+        ConnectivityManager.NetworkCallback cb = lanNetworkCallback;
+        lanNetworkCallback = null;
+        if (cb == null) return;
+        try {
+            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            if (cm != null) cm.unregisterNetworkCallback(cb);
+        } catch (Exception e) {
+            PipelineLog.w("NET_LAN", "unregisterNetworkCallback failed: " + e);
+        }
+        lanNetworks.clear();
+        lanNetwork = null;
+    }
+
+    /**
+     * Routes an unconnected client socket over the LAN network instead of the default network.
+     * No-op when no Wi-Fi/Ethernet network is tracked (e.g. phone is the hotspot: tethering
+     * routes already work unbound). Failures (VPN lockdown → EPERM) are logged and ignored.
+     */
+    void bindToLan(Socket s) {
+        Network n = lanNetwork;
+        if (n == null || s == null) return;
+        try {
+            n.bindSocket(s);
+        } catch (Exception e) {
+            PipelineLog.w("NET_LAN", "bindSocket(TCP) failed, using default route: " + e);
+        }
+    }
+
+    void bindToLan(DatagramSocket s) {
+        Network n = lanNetwork;
+        if (n == null || s == null) return;
+        try {
+            n.bindSocket(s);
+        } catch (Exception e) {
+            PipelineLog.w("NET_LAN", "bindSocket(UDP) failed, using default route: " + e);
+        }
+    }
+
+    /**
+     * Like {@link #bindToLan(Socket)}, but leaves the socket unbound when {@code targetIp} is on
+     * the subnet of a DIFFERENT local interface than the LAN network (phone is a hotspot host
+     * while also connected to Wi-Fi as a client): those peers are only reachable unbound.
+     */
+    private void bindToLan(Socket s, String targetIp) {
+        if (lanNetwork == null || s == null) return;
+        if (isOnNonLanLocalSubnet(targetIp)) {
+            PipelineLog.i("NET_LAN", "Target on a non-LAN local subnet; not binding");
+            return;
+        }
+        bindToLan(s);
+    }
+
+    private boolean isOnNonLanLocalSubnet(String targetIp) {
+        try {
+            if (targetIp == null || !android.net.InetAddresses.isNumericAddress(targetIp)) {
+                return false;
+            }
+            InetAddress target = android.net.InetAddresses.parseNumericAddress(targetIp);
+            if (!(target instanceof Inet4Address)) return false;
+            String lanIface = null;
+            Network lan = lanNetwork;
+            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            if (lan != null && cm != null) {
+                LinkProperties lp = cm.getLinkProperties(lan);
+                if (lp != null) lanIface = lp.getInterfaceName();
+            }
+            java.util.Enumeration<NetworkInterface> ifs = NetworkInterface.getNetworkInterfaces();
+            if (ifs == null) return false;
+            for (NetworkInterface ni : Collections.list(ifs)) {
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                for (InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                    InetAddress a = ia.getAddress();
+                    if (!(a instanceof Inet4Address)) continue;
+                    if (sameIpv4Subnet(a, target, ia.getNetworkPrefixLength())) {
+                        return lanIface != null && !lanIface.equals(ni.getName());
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
+
+    private static boolean sameIpv4Subnet(InetAddress a, InetAddress b, int prefixLen) {
+        if (prefixLen <= 0 || prefixLen > 32) return false;
+        byte[] x = a.getAddress(), y = b.getAddress();
+        if (x.length != 4 || y.length != 4) return false;
+        int xi = ((x[0] & 0xff) << 24) | ((x[1] & 0xff) << 16) | ((x[2] & 0xff) << 8) | (x[3] & 0xff);
+        int yi = ((y[0] & 0xff) << 24) | ((y[1] & 0xff) << 16) | ((y[2] & 0xff) << 8) | (y[3] & 0xff);
+        int mask = prefixLen == 32 ? -1 : ~(-1 >>> prefixLen);
+        return (xi & mask) == (yi & mask);
     }
 
     private void copyToClipboard(String text) {
@@ -1404,6 +1974,7 @@ public class MainActivity extends AppCompatActivity
 
     // ---------- UI HELPERS ----------
     private void updateStatus(String msg) {
+        PipelineLog.status(msg); // FIX_PLAN #21: status text also lands in logcat (IPs redacted)
         if (isFinishing() || isDestroyed()) return;
         runOnUiThread(() -> {
             if (isFinishing() || isDestroyed()) return;
@@ -1459,6 +2030,7 @@ public class MainActivity extends AppCompatActivity
                 streamFragment.showStreamingUI(sr, fmt);
             }
             isPaused.set(false);
+            applyKeepScreenOn(true); // API 35+: screen lock would stop the projection (FIX_PLAN #10)
             showNowPlayingUI(config, "Streaming from this device");
         });
     }
@@ -1494,6 +2066,10 @@ public class MainActivity extends AppCompatActivity
         runOnUiThread(() -> {
             if (isFinishing() || isDestroyed()) return;
             isPaused.set(false);
+            // Stream/receive ended: drop the capture keep-screen-on unless the user setting is
+            // on or a capture session is (still/again) running — isStreaming is already false
+            // on every stop path, so this only keeps it for a newer session or Duplex.
+            applyKeepScreenOn(isStreaming.get() || isDuplexActive.get());
             if (streamFragment != null && streamFragment.isAdded()) {
                 streamFragment.resetUI();
             }
@@ -1506,42 +2082,55 @@ public class MainActivity extends AppCompatActivity
     // ===== NOW PLAYING HELPERS =====
 
     private void showNowPlayingUI(AudioConfig config, String deviceInfo) {
-        // Try to get real media metadata
-        MediaMetadataHelper.NowPlayingInfo media = MediaMetadataHelper.getCurrentMedia(this);
-
-        String title;
-        String subtitle;
-        if (media != null && !"Unknown".equals(media.title)) {
-            title = media.title;
-            subtitle = media.getSubtitle();
-            if (subtitle.isEmpty()) {
+        if (isStreaming.get()) {
+            MediaMetadataHelper.NowPlayingInfo media = MediaMetadataHelper.getCurrentMedia(this);
+            String title;
+            String subtitle;
+            if (media != null && !"Unknown".equals(media.title)) {
+                title = media.title;
+                subtitle = media.getSubtitle();
+                if (subtitle.isEmpty()) {
+                    subtitle = config.sampleRateString() + " · "
+                            + config.channelString() + " · "
+                            + config.bitsPerSample + "-bit "
+                            + config.compressionString();
+                }
+            } else {
+                title = config.isHiRes ? "🎧 Hi-Res Stream" : "SoundShare Stream";
                 subtitle = config.sampleRateString() + " · "
                         + config.channelString() + " · "
                         + config.bitsPerSample + "-bit "
                         + config.compressionString();
             }
-        } else {
-            title = config.isHiRes ? "🎧 Hi-Res Stream" : "SoundShare Stream";
-            subtitle = config.sampleRateString() + " · "
-                    + config.channelString() + " · "
-                    + config.bitsPerSample + "-bit "
-                    + config.compressionString();
-        }
 
-        final String t = title, s = subtitle;
-        runOnUiThread(() -> {
-            if (isFinishing() || isDestroyed()) return;
-            if (isStreaming.get() && streamFragment != null && streamFragment.isAdded()) {
-                streamFragment.showNowPlaying(t, s, deviceInfo);
-            }
-            if (isReceiving.get() && receiveFragment != null && receiveFragment.isAdded()) {
-                receiveFragment.showNowPlaying(t, s, deviceInfo);
-            }
-        });
+            final String t = title, s = subtitle;
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                if (streamFragment != null && streamFragment.isAdded()) {
+                    streamFragment.showNowPlaying(t, s, deviceInfo);
+                }
+            });
+        } else if (isReceiving.get()) {
+            String title = (receivedMetaTitle != null && !receivedMetaTitle.isEmpty())
+                    ? receivedMetaTitle : (config.isHiRes ? "🎧 Hi-Res Stream" : "SoundShare Stream");
+            String subtitle = (receivedMetaArtist != null && !receivedMetaArtist.isEmpty())
+                    ? receivedMetaArtist : (config.sampleRateString() + " · " + config.channelString());
+            final String t = title, s = subtitle;
+            final Bitmap art = receivedAlbumArt;
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                if (receiveFragment != null && receiveFragment.isAdded()) {
+                    receiveFragment.showNowPlaying(t, s, deviceInfo);
+                    receiveFragment.updateNowPlayingMeta(t, s, art);
+                }
+            });
+        }
     }
 
     /** Called periodically from updateStats to refresh Now Playing with latest track info */
     private void refreshNowPlayingMetadata() {
+        if (!isStreaming.get()) return;
+
         MediaMetadataHelper.NowPlayingInfo media = MediaMetadataHelper.getCurrentMedia(this);
         if (media == null || "Unknown".equals(media.title)) return;
 
@@ -1553,20 +2142,16 @@ public class MainActivity extends AppCompatActivity
         }
 
         final String t = title, s = subtitle;
+        final Bitmap art = media.albumArt;
         runOnUiThread(() -> {
             if (isFinishing() || isDestroyed()) return;
-            if (isStreaming.get() && streamFragment != null && streamFragment.isAdded()) {
-                streamFragment.updateNowPlayingMeta(t, s);
-            }
-            if (isReceiving.get() && receiveFragment != null && receiveFragment.isAdded()) {
-                receiveFragment.updateNowPlayingMeta(t, s);
+            if (streamFragment != null && streamFragment.isAdded()) {
+                streamFragment.updateNowPlayingMeta(t, s, art);
             }
         });
 
         // Also broadcast metadata to connected clients
-        if (isStreaming.get()) {
-            broadcastMetadataToClients();
-        }
+        broadcastMetadataToClients();
     }
 
     private void updateNowPlayingElapsed(long elapsedMs) {
@@ -1784,6 +2369,16 @@ public class MainActivity extends AppCompatActivity
         };
     }
 
+    /** Reads and discards exactly {@code n} bytes (works on every API level). */
+    private static void skipFully(DataInputStream in, long n) throws IOException {
+        byte[] scratch = new byte[(int) Math.min(8192, Math.max(1, n))];
+        while (n > 0) {
+            int r = in.read(scratch, 0, (int) Math.min(scratch.length, n));
+            if (r < 0) throw new java.io.EOFException("EOF while skipping " + n + " bytes");
+            n -= r;
+        }
+    }
+
     private String readUtfField(DataInputStream in) throws IOException {
         int len = in.readUnsignedShort();
         if (len > 4096) throw new IOException("Field too long");
@@ -1798,8 +2393,9 @@ public class MainActivity extends AppCompatActivity
 
     private void startChatServer() {
         chatServerThread = new Thread(() -> {
+            ServerSocket ss = null;
             try {
-                ServerSocket ss = new ServerSocket();
+                ss = new ServerSocket();
                 ss.setReuseAddress(true);
                 ss.bind(new InetSocketAddress(CHAT_PORT));
                 ss.setSoTimeout(1000);
@@ -1811,6 +2407,7 @@ public class MainActivity extends AppCompatActivity
                         client.setSoTimeout(0);
                         ChatClient cc = new ChatClient(client);
                         chatClients.add(cc);
+                        lastMetaKey = null;   // push metadata to a joining/replacing client now (phase5 review L1)
                         addSystemChatMessage(cc.ip + " joined the chat");
                         updateChatStatus();
                         new Thread(() -> handleChatClientReads(cc),
@@ -1821,10 +2418,14 @@ public class MainActivity extends AppCompatActivity
             } catch (Exception e) {
                 if (isStreaming.get()) Log.e(TAG, "Chat server error", e);
             } finally {
-                closeQuietly(chatServerSocket);
-                chatServerSocket = null;
-                for (ChatClient cc : chatClients) cc.close();
-                chatClients.clear();
+                // FIX_PLAN #12: close OUR socket; only touch shared state if a newer session
+                // hasn't replaced it (Stop→Start race).
+                closeQuietly(ss);
+                if (chatServerSocket == ss) {
+                    chatServerSocket = null;
+                    for (ChatClient cc : chatClients) cc.close();
+                    chatClients.clear();
+                }
             }
         }, "ChatServerThread");
         chatServerThread.start();
@@ -1846,6 +2447,7 @@ public class MainActivity extends AppCompatActivity
         } finally {
             cc.close();
             chatClients.remove(cc);
+            lastMetaKey = null;   // push metadata to a joining/replacing client now (phase5 review L1)
             addSystemChatMessage(cc.ip + " left the chat");
             updateChatStatus();
         }
@@ -1860,6 +2462,7 @@ public class MainActivity extends AppCompatActivity
                     } catch (IOException e) {
                         cc.close();
                         chatClients.remove(cc);
+                        lastMetaKey = null;   // push metadata to a joining/replacing client now (phase5 review L1)
                     }
                 }
             }
@@ -1875,6 +2478,7 @@ public class MainActivity extends AppCompatActivity
                 } catch (IOException e) {
                     cc.close();
                     chatClients.remove(cc);
+                    lastMetaKey = null;   // push metadata to a joining/replacing client now (phase5 review L1)
                 }
             }
         }
@@ -1905,14 +2509,22 @@ public class MainActivity extends AppCompatActivity
     //  CHAT CLIENT (RECEIVER)
     // ==========================================================
 
-    private void startChatClient(String serverIp) {
+    /** True while {@code s} is the live receive session (phase5 review M3: clients are session-bound). */
+    private boolean isCurrentReceive(ReceiveSession s) {
+        return s != null && s.running.get() && currentReceiveSession.get() == s && isReceiving.get();
+    }
+
+    private void startChatClient(String serverIp, final ReceiveSession rs) {
         chatClientThread = new Thread(() -> {
             Socket sock = null;
             try {
                 Thread.sleep(500);
+                if (!isCurrentReceive(rs)) return;
                 sock = new Socket();
+                bindToLan(sock, serverIp);
                 sock.setTcpNoDelay(true);
                 sock.connect(new InetSocketAddress(serverIp, CHAT_PORT), 5000);
+                if (!isCurrentReceive(rs)) return;   // a newer session owns the chat channel
                 chatSocket = sock;
                 DataInputStream din = new DataInputStream(sock.getInputStream());
                 DataOutputStream dout = new DataOutputStream(sock.getOutputStream());
@@ -1924,7 +2536,7 @@ public class MainActivity extends AppCompatActivity
                 });
                 addSystemChatMessage("Connected to chat");
                 chatClientOut = dout;
-                while (isReceiving.get()) {
+                while (isCurrentReceive(rs)) {
                     byte cmd = din.readByte();
                     if (cmd == CHAT_MSG) {
                         String[] parts = readChatMessage(din);
@@ -1939,10 +2551,14 @@ public class MainActivity extends AppCompatActivity
                         // Read album art bytes
                         int artLen = din.readInt();
                         Bitmap art = null;
-                        if (artLen > 0 && artLen < 1_500_000) {
+                        if (artLen < 0) throw new IOException("Bad art length");
+                        if (artLen > 0 && artLen < META_ART_MAX_BYTES) {
                             byte[] artBytes = new byte[artLen];
                             din.readFully(artBytes);
                             art = android.graphics.BitmapFactory.decodeByteArray(artBytes, 0, artLen);
+                        } else if (artLen > 0) {
+                            // Oversized art: consume it so the chat stream stays in sync (FIX_PLAN #15).
+                            skipFully(din, artLen);
                         }
                         String subtitle = artist;
                         if (!album.isEmpty()) {
@@ -1955,10 +2571,11 @@ public class MainActivity extends AppCompatActivity
                         receivedDurationMs = durMs;
                         receivedPositionMs = posMs;
                         final String t = title, s = receivedMetaArtist;
+                        final Bitmap finalArt = art;
                         runOnUiThread(() -> {
                             if (isFinishing() || isDestroyed()) return;
                             if (receiveFragment != null && receiveFragment.isAdded()) {
-                                receiveFragment.updateNowPlayingMeta(t, s);
+                                receiveFragment.updateNowPlayingMeta(t, s, finalArt);
                             }
                             updateReceiverNotification();
                         });
@@ -1967,8 +2584,10 @@ public class MainActivity extends AppCompatActivity
                         runOnUiThread(() -> {
                             AudioTrack at = audioTrack;
                             if (at != null && !isPaused.get()) {
-                                at.pause();
+                                // Set the flag first so the receive thread stops writing (F-08),
+                                // and tolerate a track released/recreated concurrently (FIX_PLAN #13).
                                 isPaused.set(true);
+                                try { at.pause(); } catch (IllegalStateException ignored) {}
                                 updatePlayPauseButton(true);
                                 updateNowPlayingState("Paused", R.color.accent_orange);
                                 updateReceiverNotification();
@@ -1980,7 +2599,7 @@ public class MainActivity extends AppCompatActivity
                         runOnUiThread(() -> {
                             AudioTrack at = audioTrack;
                             if (at != null && isPaused.get()) {
-                                at.play();
+                                try { at.play(); } catch (IllegalStateException ignored) {}
                                 isPaused.set(false);
                                 updatePlayPauseButton(false);
                                 updateNowPlayingState("Live", R.color.accent_green);
@@ -1995,9 +2614,14 @@ public class MainActivity extends AppCompatActivity
                 if (isReceiving.get())
                     Log.w(TAG, "Chat client error: " + e.getMessage());
             } finally {
-                chatClientOut = null;
                 closeQuietly(sock);
-                chatSocket = null;
+                boolean wasOurs = sock != null && chatSocket == sock;
+                if (wasOurs) {   // don't clear a newer session's chat (FIX_PLAN #12)
+                    chatSocket = null;
+                    chatClientOut = null;
+                }
+                // A superseded session must not print "Disconnected" over the new session's chat
+                if (wasOurs || currentReceiveSession.get() == rs) {
                 addSystemChatMessage("Chat disconnected");
                 runOnUiThread(() -> {
                     if (isFinishing() || isDestroyed()) return;
@@ -2005,6 +2629,7 @@ public class MainActivity extends AppCompatActivity
                         receiveFragment.updateChatStatus("Disconnected", R.color.accent_red);
                     }
                 });
+                }
             }
         }, "ChatClientThread");
         chatClientThread.start();
@@ -2040,8 +2665,9 @@ public class MainActivity extends AppCompatActivity
 
     private void startPingServer() {
         pingServerThread = new Thread(() -> {
+            ServerSocket ss = null;
             try {
-                ServerSocket ss = new ServerSocket();
+                ss = new ServerSocket();
                 ss.setReuseAddress(true);
                 ss.bind(new InetSocketAddress(PING_PORT));
                 ss.setSoTimeout(1000);
@@ -2050,7 +2676,8 @@ public class MainActivity extends AppCompatActivity
                     try {
                         Socket client = ss.accept();
                         client.setTcpNoDelay(true);
-                        client.setSoTimeout(3000);
+                        // Short per-read timeout; handlePingClient only drops after ~15 s idle.
+                        client.setSoTimeout(PING_READ_TIMEOUT_MS);
                         new Thread(() -> handlePingClient(client),
                                 "PingHandler").start();
                     } catch (SocketTimeoutException ignored) {
@@ -2059,8 +2686,8 @@ public class MainActivity extends AppCompatActivity
             } catch (Exception e) {
                 if (isStreaming.get()) Log.e(TAG, "Ping server error", e);
             } finally {
-                closeQuietly(pingServerSocket);
-                pingServerSocket = null;
+                closeQuietly(ss);                                // FIX_PLAN #12
+                if (pingServerSocket == ss) pingServerSocket = null;
             }
         }, "PingServerThread");
         pingServerThread.start();
@@ -2070,8 +2697,22 @@ public class MainActivity extends AppCompatActivity
         try {
             DataInputStream din = new DataInputStream(client.getInputStream());
             DataOutputStream dout = new DataOutputStream(client.getOutputStream());
+            long lastRxMs = android.os.SystemClock.elapsedRealtime();
             while (isStreaming.get()) {
-                byte cmd = din.readByte();
+                byte cmd;
+                try {
+                    cmd = din.readByte();
+                    lastRxMs = android.os.SystemClock.elapsedRealtime();
+                } catch (SocketTimeoutException t) {
+                    // FIX_PLAN #17: a Wi-Fi power-save stall/roam must not kill the control
+                    // channel for the rest of the session; drop only after ~15 s of silence.
+                    if (android.os.SystemClock.elapsedRealtime() - lastRxMs > PING_IDLE_DROP_MS) {
+                        PipelineLog.w("CONNECT", "Ping client idle > "
+                                + PING_IDLE_DROP_MS / 1000 + " s, dropping");
+                        break;
+                    }
+                    continue;
+                }
                 if (cmd == PING_REQUEST) {
                     dout.writeByte(PING_RESPONSE);
                     dout.flush();
@@ -2084,7 +2725,11 @@ public class MainActivity extends AppCompatActivity
                     runOnUiThread(() -> {
                         AudioRecord ar = recorder;
                         if (ar != null && !isPaused.get()) {
-                            ar.stop();
+                            try {
+                                ar.stop();
+                            } catch (IllegalStateException ise) {   // FIX_PLAN #28
+                                Log.w(TAG, "Remote pause: recorder.stop failed: " + ise.getMessage());
+                            }
                             isPaused.set(true);
                             updatePlayPauseButton(true);
                             updateNowPlayingState("Paused", R.color.accent_orange);
@@ -2099,7 +2744,11 @@ public class MainActivity extends AppCompatActivity
                     runOnUiThread(() -> {
                         AudioRecord ar = recorder;
                         if (ar != null && isPaused.get()) {
-                            ar.startRecording();
+                            try {
+                                ar.startRecording();
+                            } catch (IllegalStateException ise) {   // FIX_PLAN #28
+                                Log.w(TAG, "Remote resume: startRecording failed: " + ise.getMessage());
+                            }
                             isPaused.set(false);
                             updatePlayPauseButton(false);
                             updateNowPlayingState("Live", R.color.accent_green);
@@ -2134,24 +2783,35 @@ public class MainActivity extends AppCompatActivity
     //  PING CLIENT
     // ==========================================================
 
-    private void startPingClient(String serverIp) {
+    private void startPingClient(String serverIp, final ReceiveSession rs) {
         pingClientThread = new Thread(() -> {
             Socket sock = null;
             try {
                 Thread.sleep(300);
+                if (!isCurrentReceive(rs)) return;
                 sock = new Socket();
+                bindToLan(sock, serverIp);
                 sock.setTcpNoDelay(true);
                 sock.setSoTimeout(2000);
                 sock.connect(new InetSocketAddress(serverIp, PING_PORT), 3000);
-                pingSocket = sock;
+                PipelineLog.i("CONNECT", "Ping channel connected to "
+                        + PipelineLog.redactIps(serverIp));
                 DataOutputStream dout = new DataOutputStream(sock.getOutputStream());
                 DataInputStream din = new DataInputStream(sock.getInputStream());
+                if (!isCurrentReceive(rs)) return;   // a newer session owns the ping channel
+                // ONE writer shared with sendControlMessage, guarded by pingWriteLock (FIX_PLAN #17)
+                synchronized (pingWriteLock) {
+                    pingOut = dout;
+                }
+                pingSocket = sock;
                 long smoothedMs = -1;
-                while (isReceiving.get()) {
+                while (isCurrentReceive(rs)) {
                     try {
                         long startNs = System.nanoTime();
-                        dout.writeByte(PING_REQUEST);
-                        dout.flush();
+                        synchronized (pingWriteLock) {
+                            dout.writeByte(PING_REQUEST);
+                            dout.flush();
+                        }
                         byte resp = din.readByte();
                         if (resp == PING_RESPONSE) {
                             long rttMs = (System.nanoTime() - startNs) / 1_000_000;
@@ -2162,9 +2822,11 @@ public class MainActivity extends AppCompatActivity
                             currentLatencyMs.set(smoothedMs);
                             updateLatencyUI(smoothedMs);
                             try {
-                                dout.writeByte(LATENCY_REPORT);
-                                dout.writeLong(smoothedMs);
-                                dout.flush();
+                                synchronized (pingWriteLock) {   // byte + long atomically
+                                    dout.writeByte(LATENCY_REPORT);
+                                    dout.writeLong(smoothedMs);
+                                    dout.flush();
+                                }
                             } catch (IOException ignored) {
                             }
                         }
@@ -2180,7 +2842,12 @@ public class MainActivity extends AppCompatActivity
                     Log.w(TAG, "Ping error: " + e.getMessage());
             } finally {
                 closeQuietly(sock);
-                pingSocket = null;
+                // sock != null: a thread that exits before connecting must not clear a newer
+                // session's pingOut, which is published before pingSocket
+                if (sock != null && pingSocket == sock) {   // don't clear a newer session's channel (FIX_PLAN #12)
+                    pingSocket = null;
+                    pingOut = null;         // volatile; no lock (a stalled writer must not block us)
+                }
             }
         }, "PingClientThread");
         pingClientThread.start();
@@ -2189,11 +2856,111 @@ public class MainActivity extends AppCompatActivity
     private void stopPingClient() {
         closeQuietly(pingSocket);
         pingSocket = null;
+        pingOut = null;
     }
 
     // ==========================================================
     //  STREAMING (with FLAC + Hi-Res support)
     // ==========================================================
+
+    // ===== Session ownership (FIX_PLAN #12) =====
+    // Each Stream/Receive start creates its own session object. A thread's finally block only
+    // resets shared state (flags, fields, service, UI) if its session is still the current one,
+    // so a slow old session can no longer tear down a newer one.
+
+    /** Per-session state of one Stream (sender) session. */
+    private static final class StreamSession {
+        final AtomicBoolean running = new AtomicBoolean(true);
+        /** Released once the capture format is final (or capture failed). */
+        final CountDownLatch configReady = new CountDownLatch(1);
+        final AtomicReference<AudioConfig> effectiveConfig = new AtomicReference<>();
+        volatile ServerSocket server;
+        volatile AudioRecord record;
+        volatile String failReason;
+    }
+
+    private final AtomicReference<StreamSession> currentStreamSession = new AtomicReference<>();
+
+    /** Waits until the session's capture format is known. Returns null if capture failed or the session ended. */
+    private AudioConfig awaitEffectiveConfig(StreamSession s) throws InterruptedException {
+        while (s.running.get()) {
+            if (s.configReady.await(200, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                return s.effectiveConfig.get();
+            }
+        }
+        return null;
+    }
+
+    /** Stops (not releases) the session's AudioRecord so a blocked read() returns. */
+    private void stopSessionRecorder(StreamSession s) {
+        AudioRecord r = s.record;
+        if (r != null) {
+            try { r.stop(); } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Builds and starts a playback-capture AudioRecord for {@code c}. Returns null (and logs) if the
+     * device rejects that format, so the caller can try the next entry of the fallback chain.
+     */
+    @SuppressLint("MissingPermission")
+    private AudioRecord openCaptureRecord(AudioConfig c, MediaProjection proj) {
+        String desc = String.format(Locale.US, "%dHz %dbit %dch", c.sampleRate, c.bitsPerSample, c.channels);
+        AudioRecord r = null;
+        try {
+            AudioPlaybackCaptureConfiguration cc =
+                    new AudioPlaybackCaptureConfiguration.Builder(proj)
+                            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                            .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                            .build();
+
+            AudioFormat fmt = new AudioFormat.Builder()
+                    .setEncoding(c.encoding)
+                    .setSampleRate(c.sampleRate)
+                    .setChannelMask(c.channelInMask)
+                    .build();
+
+            int bytesPerFrame = c.channels * c.bytesPerSample;
+            int minBuf = AudioRecord.getMinBufferSize(c.sampleRate, c.channelInMask, c.encoding);
+            // ≥ the old chunk-based size, and ≥ ~250 ms so short network stalls don't overflow it
+            int recBuf = Math.max(Math.max(minBuf, 0),
+                    Math.max(c.chunkSize * (c.presetIndex <= 1 ? 2 : 4),
+                            c.sampleRate * bytesPerFrame / 4));
+            recBuf = getCalculatedBufferSize(recBuf, bytesPerFrame);
+
+            r = new AudioRecord.Builder()
+                    .setAudioFormat(fmt)
+                    .setBufferSizeInBytes(recBuf)
+                    .setAudioPlaybackCaptureConfig(cc)
+                    .build();
+
+            if (r.getState() != AudioRecord.STATE_INITIALIZED) {
+                PipelineLog.w("CAPTURE_OPEN", desc + " not initialized (minBuf=" + minBuf + ")");
+            } else {
+                r.startRecording();
+                if (r.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
+                    PipelineLog.i("CAPTURE_OPEN", desc + " ok, buffer=" + recBuf + " B");
+                    return r;
+                }
+                PipelineLog.w("CAPTURE_OPEN", desc + " startRecording did not start");
+            }
+        } catch (UnsupportedOperationException | IllegalArgumentException | IllegalStateException e) {
+            PipelineLog.w("CAPTURE_OPEN", desc + " rejected: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
+        }
+        if (r != null) {
+            try { r.release(); } catch (Exception ignored) {}
+        }
+        return null;
+    }
+
+    /** Stops a specific MediaProjection instance; clears the field only if it still holds that instance. */
+    private void releaseProjection(MediaProjection p) {
+        if (p == null) return;
+        if (mediaProjection == p) mediaProjection = null;
+        try { p.stop(); } catch (Exception ignored) {}
+    }
 
     @SuppressLint("MissingPermission")
     private void startStreaming() {
@@ -2202,8 +2969,17 @@ public class MainActivity extends AppCompatActivity
             return;
         }
 
+        // This session's projection instance (FIX_PLAN #12): finally stops this one, not the field
+        final MediaProjection proj = mediaProjection;
+        if (proj == null) {
+            updateStatus("Screen capture permission missing — tap Start again");
+            stopForegroundService();
+            return;
+        }
+
+        final int presetIdx = selectedPreset;
         final AudioConfig config = new AudioConfig(
-                QUALITY_PRESETS[selectedPreset], selectedPreset);
+                QUALITY_PRESETS[presetIdx], presetIdx);
         activeConfig.set(config);
 
         if (config.useFLAC && !FlacCodec.isFlacEncoderAvailable()) {
@@ -2211,7 +2987,15 @@ public class MainActivity extends AppCompatActivity
             return;
         }
 
+        final StreamSession session = new StreamSession();
+        StreamSession previous = currentStreamSession.getAndSet(session);
+        if (previous != null) {
+            previous.running.set(false);
+            stopSessionRecorder(previous);
+        }
+
         isStreaming.set(true);
+        lastMetaKey = null;   // phase5 review L1
         totalBytesSent.set(0);
         receiverCount.set(0);
         connectedClients.clear();
@@ -2228,33 +3012,47 @@ public class MainActivity extends AppCompatActivity
 
         final CountDownLatch acceptStopped = new CountDownLatch(1);
 
-        // Accept thread
+        // Accept thread: may accept early, but writes the header only once the capture
+        // format is final (FIX_PLAN #5), so a fallback never sends a wrong header.
         acceptThread = new Thread(() -> {
+            ServerSocket ls = null;
             try {
-                ServerSocket ls = new ServerSocket();
+                ls = new ServerSocket();
                 ls.setReuseAddress(true);
+                int streamPort = getActiveStreamPort();
                 try {
-                    ls.bind(new InetSocketAddress(PORT));
+                    ls.bind(new InetSocketAddress(streamPort));
                 } catch (java.net.BindException e) {
-                    updateStatus("Port " + PORT + " in use");
-                    isStreaming.set(false);
-                    resetUI();
+                    session.failReason = "Port " + streamPort + " in use";
+                    updateStatus(session.failReason);
+                    session.running.set(false);
+                    stopSessionRecorder(session);   // the stream thread's finally cleans up
                     return;
                 }
                 ls.setSoTimeout(1000);
-                serverSocket = ls;
-                updateStatus("Waiting on " + getDeviceIpAddress() + ":" + PORT);
+                session.server = ls;
+                if (currentStreamSession.get() == session) serverSocket = ls;
+                if (!session.running.get()) return;
+                updateStatus("Waiting on " + getDeviceIpAddress() + ":" + streamPort);
 
-                while (isStreaming.get()) {
+                while (session.running.get() && isStreaming.get()) {
+                    Socket client = null;
                     try {
-                        Socket client = ls.accept();
-                        client.setTcpNoDelay(true);
-                        client.setSendBufferSize(config.socketBufferSize);
+                        client = ls.accept();
+                        client.setTcpNoDelay(SettingsFragment.isTcpNoDelay(MainActivity.this));
                         client.setKeepAlive(true);
                         client.setTrafficClass(0x10);
 
+                        AudioConfig eff = awaitEffectiveConfig(session);
+                        if (eff == null || !session.running.get()) {
+                            closeQuietly(client);
+                            continue;
+                        }
+                        client.setSendBufferSize(AudioPipelineUtils.senderSocketBufferBytes(
+                                eff.sampleRate, eff.channels, eff.bytesPerSample));
+
                         ClientConnection conn = new ClientConnection(client);
-                        writeFormatHeader(conn.outputStream, config);
+                        writeFormatHeader(conn.outputStream, eff);
                         connectedClients.add(conn);
                         receiverCount.incrementAndGet();
                         updateReceiverCount();
@@ -2262,15 +3060,19 @@ public class MainActivity extends AppCompatActivity
                                 + " receiver(s)");
                     } catch (SocketTimeoutException ignored) {
                     } catch (IOException e) {
-                        if (isStreaming.get()) Log.e(TAG, "Accept error", e);
+                        closeQuietly(client);
+                        if (session.running.get()) Log.e(TAG, "Accept error", e);
                     }
                 }
+            } catch (InterruptedException ignored) {
             } catch (Exception e) {
-                if (isStreaming.get()) {
+                if (session.running.get()) {
                     Log.e(TAG, "Server error", e);
                     updateStatus("Server error: " + e.getMessage());
                 }
             } finally {
+                closeQuietly(ls);
+                if (ls != null && serverSocket == ls) serverSocket = null;
                 acceptStopped.countDown();
             }
         }, "AcceptThread");
@@ -2281,70 +3083,121 @@ public class MainActivity extends AppCompatActivity
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
             AudioRecord lr = null;
             FlacCodec.Encoder flacEncoder = null;
+            AudioConfig eff = null;
 
             try {
                 Thread.sleep(200);
-                if (!isStreaming.get()) return;
+                if (!session.running.get()) return;
 
-                AudioPlaybackCaptureConfiguration cc =
-                        new AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
-                                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                                .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                                .build();
-
-                AudioFormat fmt = new AudioFormat.Builder()
-                        .setEncoding(config.encoding)
-                        .setSampleRate(config.sampleRate)
-                        .setChannelMask(config.channelInMask)
-                        .build();
-
-                int minBuf = AudioRecord.getMinBufferSize(
-                        config.sampleRate, config.channelInMask, config.encoding);
-                int recBuf = Math.max(minBuf,
-                        config.chunkSize * (config.presetIndex <= 1 ? 2 : 4));
-
-                lr = new AudioRecord.Builder()
-                        .setAudioFormat(fmt)
-                        .setBufferSizeInBytes(recBuf)
-                        .setAudioPlaybackCaptureConfig(cc)
-                        .build();
-                recorder = lr;
-
-                if (lr.getState() != AudioRecord.STATE_INITIALIZED) {
-                    updateStatus("AudioRecord init failed");
-                    isStreaming.set(false);
+                // Open the capture BEFORE any header is sent: requested → 48k/16 → 44.1k/16 (FIX_PLAN #5)
+                int[][] chain = AudioPipelineUtils.captureFallbackChain(QUALITY_PRESETS[presetIdx]);
+                for (int i = 0; i < chain.length && lr == null && session.running.get(); i++) {
+                    AudioConfig cand = (i == 0) ? config : new AudioConfig(chain[i], 2);
+                    lr = openCaptureRecord(cand, proj);
+                    if (lr != null) eff = cand;
+                }
+                if (lr == null || eff == null) {
+                    if (session.running.get()) {
+                        session.failReason = "This phone can't capture audio in any supported format";
+                        PipelineLog.e("CAPTURE_OPEN", "capture fallback chain exhausted", null);
+                    }
                     return;
+                }
+                session.record = lr;
+                if (currentStreamSession.get() == session) recorder = lr;
+                if (!session.running.get()) return;
+
+                if (eff != config) {
+                    PipelineLog.w("CAPTURE_FALLBACK", String.format(Locale.US,
+                            "requested %dHz/%dbit, using %dHz/%dbit",
+                            config.sampleRate, config.bitsPerSample,
+                            eff.sampleRate, eff.bitsPerSample));
+                }
+                activeConfig.set(eff);
+                session.effectiveConfig.set(eff);
+                session.configReady.countDown();   // AcceptThread may now send headers
+                if (eff != config) {
+                    showStreamingUI(eff);
+                    updateStatus(String.format(Locale.US,
+                            "%s capture not supported on this phone — streaming %s/%d-bit",
+                            config.isHiRes || config.bitsPerSample > 16 ? "Hi-Res" : "This format",
+                            eff.sampleRateString(), eff.bitsPerSample));
                 }
 
                 // Initialize FLAC encoder if needed
-                if (config.useFLAC) {
+                if (eff.useFLAC) {
                     flacEncoder = new FlacCodec.Encoder(
-                            config.sampleRate, config.channels,
-                            config.bitsPerSample, config.framesPerBuffer);
+                            eff.sampleRate, eff.channels,
+                            eff.bitsPerSample, eff.framesPerBuffer);
                     if (!flacEncoder.start()) {
-                        updateStatus("FLAC encoder failed to start");
-                        isStreaming.set(false);
+                        session.failReason = "FLAC encoder failed to start";
                         return;
                     }
                     Log.i(TAG, "FLAC lossless encoding enabled");
                 }
 
-                lr.startRecording();
-
-                byte[] pcmBuffer = new byte[config.chunkSize];
+                byte[] pcmBuffer = new byte[eff.chunkSize];
                 streamStartTime.set(System.currentTimeMillis());
                 lastTimeMs.set(System.currentTimeMillis());
                 bytesSentThisSecond.set(0);
 
-                while (isStreaming.get()) {
+                int errorReads = 0;
+                int deadReads = 0;
+                long silentSinceMs = 0;
+                boolean silenceHintShown = false;
+
+                while (session.running.get() && isStreaming.get()) {
+                    if (isPaused.get()) {
+                        silentSinceMs = 0;
+                        try {
+                            Thread.sleep(50);
+                        } catch (InterruptedException ignored) {}
+                        continue;
+                    }
                     int read = lr.read(pcmBuffer, 0, pcmBuffer.length);
-                    if (read <= 0 || connectedClients.isEmpty()) continue;
+                    if (!session.running.get()) break;
+                    if (read <= 0) {
+                        // Never spin on error codes (FIX_PLAN #13 / F-06)
+                        if (read < 0) {
+                            if (errorReads++ % 100 == 0) {
+                                PipelineLog.w("READ_ERR", "AudioRecord.read=" + read
+                                        + " (count " + errorReads + ")");
+                            }
+                            if (read == AudioRecord.ERROR_DEAD_OBJECT && ++deadReads >= 5) {
+                                session.failReason = "Audio capture lost (audio system error)";
+                                PipelineLog.e("READ_ERR", "AudioRecord dead, giving up", null);
+                                break;
+                            }
+                        }
+                        Thread.sleep(10);
+                        continue;
+                    }
+                    deadReads = 0;
+                    if (connectedClients.isEmpty()) {
+                        silentSinceMs = 0;
+                        continue;
+                    }
+
+                    // Silent-capture hint (FIX_PLAN #20): all-zero capture for ≥5 s with clients connected
+                    if (!silenceHintShown) {
+                        if (AudioPipelineUtils.isSilent(pcmBuffer, 0, read)) {
+                            long nowMs = System.currentTimeMillis();
+                            if (silentSinceMs == 0) {
+                                silentSinceMs = nowMs;
+                            } else if (nowMs - silentSinceMs >= 5000) {
+                                silenceHintShown = true;
+                                PipelineLog.w("SILENCE", "all-zero capture for 5 s with clients connected");
+                                updateStatus("Capturing silence — the playing app may block audio capture");
+                            }
+                        } else {
+                            silentSinceMs = 0;
+                        }
+                    }
 
                     byte[] sendData;
                     int sendLength;
 
-                    if (config.useFLAC && flacEncoder != null) {
+                    if (eff.useFLAC && flacEncoder != null) {
                         byte[] compressed = flacEncoder.encode(pcmBuffer, read);
                         if (compressed == null || compressed.length == 0) continue;
                         sendData = compressed;
@@ -2356,7 +3209,7 @@ public class MainActivity extends AppCompatActivity
 
                     // For FLAC: frame with length prefix
                     byte[] packet;
-                    if (config.useFLAC) {
+                    if (eff.useFLAC) {
                         packet = new byte[4 + sendLength];
                         packet[0] = (byte) ((sendLength >> 24) & 0xFF);
                         packet[1] = (byte) ((sendLength >> 16) & 0xFF);
@@ -2412,32 +3265,44 @@ public class MainActivity extends AppCompatActivity
                 }
             } catch (InterruptedException ignored) {
             } catch (Exception e) {
-                if (isStreaming.get()) {
+                if (session.running.get()) {
                     Log.e(TAG, "Stream error", e);
-                    updateStatus("Stream error: " + e.getMessage());
+                    session.failReason = "Stream error: " + e.getMessage();
                 }
             } finally {
-                isStreaming.set(false);
-                stopPingServer();
-                stopChatServer();
-                closeQuietly(serverSocket);
-                serverSocket = null;
+                session.running.set(false);
+                session.configReady.countDown();   // never leave the AcceptThread waiting
+                // Only the session that is still current may reset shared state (FIX_PLAN #12)
+                boolean owner = currentStreamSession.compareAndSet(session, null);
+                if (owner) {
+                    isStreaming.set(false);
+                    stopPingServer();
+                    stopChatServer();
+                    stopDiscoveryServer();
+                }
+                ServerSocket ss = session.server;
+                closeQuietly(ss);
+                if (ss != null && serverSocket == ss) serverSocket = null;
                 try {
-                    acceptStopped.await();
+                    acceptStopped.await(3, java.util.concurrent.TimeUnit.SECONDS);
                 } catch (InterruptedException ignored) {
                 }
 
                 if (flacEncoder != null) flacEncoder.release();
 
+                if (lr != null && recorder == lr) recorder = null;
                 cleanupRecorder(lr);
-                recorder = null;
-                for (ClientConnection c : connectedClients) c.close();
-                connectedClients.clear();
-                receiverCount.set(0);
-                releaseProjection();
-                stopForegroundService();
-                resetUI();
-                updateStatus("Streaming stopped");
+                // Stop THIS session's projection instance, never a newer one
+                releaseProjection(proj);
+                if (owner) {
+                    for (ClientConnection c : connectedClients) c.close();
+                    connectedClients.clear();
+                    receiverCount.set(0);
+                    stopForegroundService();
+                    resetUI();
+                    String reason = session.failReason;
+                    updateStatus(reason != null ? "Stopped: " + reason : "Streaming stopped");
+                }
             }
         }, "AudioStreamThread");
         streamThread.start();
@@ -2446,6 +3311,16 @@ public class MainActivity extends AppCompatActivity
     private void stopStreaming() {
         if (!isStreaming.compareAndSet(true, false)) return;
         updateStatus("Stopping...");
+        StreamSession s = currentStreamSession.get();
+        if (s != null) {
+            s.running.set(false);
+            stopSessionRecorder(s);      // unblocks a pending AudioRecord.read()
+            closeQuietly(s.server);
+        }
+        AudioRecord r = recorder;
+        if (r != null) {
+            try { r.stop(); } catch (Exception ignored) {}
+        }
         stopPingServer();
         stopChatServer();
         stopDiscoveryServer();
@@ -2460,7 +3335,168 @@ public class MainActivity extends AppCompatActivity
     //  RECEIVING (with FLAC + Hi-Res support)
     // ==========================================================
 
+    /** Per-session state of one Receive session (FIX_PLAN #12/#13/#16). */
+    private static final class ReceiveSession {
+        final AtomicBoolean running = new AtomicBoolean(true);
+        volatile Socket socket;
+        volatile AudioTrack track;
+        volatile String failReason;
+        /** Track was built as PCM_16BIT for a 32-bit stream; convert in software. */
+        boolean convert32to16;
+        boolean trackRecreated;
+        int playBuf;
+        int readTimeouts;
+        byte[] convBuf;
+    }
+
+    private final AtomicReference<ReceiveSession> currentReceiveSession = new AtomicReference<>();
+
+    private AudioTrack tryBuildTrack(int encoding, int sampleRate, int channelMask,
+                                     int bufBytes, int perfMode, String step) {
+        AudioTrack t = null;
+        try {
+            t = new AudioTrack.Builder()
+                    .setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build())
+                    .setAudioFormat(new AudioFormat.Builder()
+                            .setEncoding(encoding)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(channelMask)
+                            .build())
+                    .setBufferSizeInBytes(bufBytes)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .setPerformanceMode(perfMode)
+                    .build();
+            if (t.getState() == AudioTrack.STATE_INITIALIZED) {
+                PipelineLog.i("TRACK_BUILD", String.format(Locale.US,
+                        "%s: %dHz enc=%d buf=%d perf=%d", step, sampleRate, encoding, bufBytes, perfMode));
+                return t;
+            }
+            PipelineLog.w("TRACK_FALLBACK", step + ": not initialized");
+        } catch (UnsupportedOperationException | IllegalArgumentException e) {
+            PipelineLog.w("TRACK_FALLBACK", step + " rejected: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
+        }
+        if (t != null) {
+            try { t.release(); } catch (Exception ignored) {}
+        }
+        return null;
+    }
+
+    /**
+     * Receiver AudioTrack fallback chain (FIX_PLAN #13): requested perf mode → PERFORMANCE_MODE_NONE →
+     * smaller buffer → (32-bit streams only) PCM_16BIT with software conversion. Returns null if all fail.
+     */
+    private AudioTrack buildReceiveTrack(AudioConfig c, ReceiveSession s) {
+        int perf = getAudioPerformanceMode();
+        int none = AudioTrack.PERFORMANCE_MODE_NONE;
+        s.convert32to16 = false;
+        AudioTrack t = tryBuildTrack(c.encoding, c.sampleRate, c.channelOutMask, s.playBuf, perf, "requested");
+        if (t == null && perf != none) {
+            t = tryBuildTrack(c.encoding, c.sampleRate, c.channelOutMask, s.playBuf, none, "perf NONE");
+        }
+        if (t == null) {
+            int minBuf = AudioTrack.getMinBufferSize(c.sampleRate, c.channelOutMask, c.encoding);
+            int small = Math.max(minBuf * 2, 32768);
+            t = tryBuildTrack(c.encoding, c.sampleRate, c.channelOutMask, small, none, "small buffer");
+        }
+        if (t == null && c.bytesPerSample == 4 && !c.isFloat) {
+            int min16 = AudioTrack.getMinBufferSize(c.sampleRate, c.channelOutMask,
+                    AudioFormat.ENCODING_PCM_16BIT);
+            int buf16 = Math.max(Math.max(min16 * 2, 32768), s.playBuf / 2);
+            t = tryBuildTrack(AudioFormat.ENCODING_PCM_16BIT, c.sampleRate, c.channelOutMask,
+                    buf16, none, "32->16-bit conversion");
+            if (t != null) s.convert32to16 = true;
+        }
+        return t;
+    }
+
+    /** True while the ping channel to the streamer is connected and answering. */
+    private boolean isPingChannelAlive() {
+        Socket ps = pingSocket;
+        long lat = currentLatencyMs.get();
+        return ps != null && ps.isConnected() && !ps.isClosed() && lat >= 0 && lat < 999;
+    }
+
+    /** Audio socket read timed out: keep going while paused or while the ping channel is alive (FIX_PLAN #16). */
+    private boolean tolerateReadTimeout(ReceiveSession s) {
+        if (isPaused.get() || isPingChannelAlive()) {
+            s.readTimeouts = 0;
+            return true;
+        }
+        s.readTimeouts++;
+        PipelineLog.w("READ_ERR", "audio socket read timeout #" + s.readTimeouts);
+        if (s.readTimeouts >= 3) {
+            s.failReason = "Streamer not responding";
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Writes one PCM chunk to the session's track: optional 32→16-bit conversion, format-aware DSP,
+     * write-error handling with one track recreation. Returns false if the session must end.
+     */
+    private boolean writeToReceiveTrack(ReceiveSession s, AudioConfig config, byte[] data, int len) {
+        AudioTrack t = s.track;
+        if (t == null) return false;
+        byte[] out = data;
+        int outLen = len;
+        int bps = config.bytesPerSample;
+        if (s.convert32to16) {
+            int need = len / 2;
+            if (s.convBuf == null || s.convBuf.length < need) s.convBuf = new byte[need];
+            outLen = AudioPipelineUtils.convert32to16(data, 0, len, s.convBuf);
+            out = s.convBuf;
+            bps = 2;
+        }
+        AudioPipelineUtils.applyDsp(out, 0, outLen,
+                SettingsFragment.getAudioGainMultiplier(MainActivity.this),
+                SettingsFragment.getChannelMode(MainActivity.this),
+                bps, config.channels);
+        int w = t.write(out, 0, outLen);
+        if (w >= 0) return true;
+        // stop()/pause() from another thread can make a write fail; that is not an output error
+        if (!s.running.get() || isPaused.get()) return true;
+
+        PipelineLog.w("WRITE_ERR", "AudioTrack.write=" + w);
+        if (s.trackRecreated) {
+            s.failReason = "Audio output failed (error " + w + ")";
+            return false;
+        }
+        s.trackRecreated = true;
+        boolean owner = currentReceiveSession.get() == s;
+        if (owner && audioTrack == t) audioTrack = null;
+        s.track = null;
+        cleanupTrack(t);
+        AudioTrack nt = buildReceiveTrack(config, s);
+        if (nt == null) {
+            s.failReason = "Audio output lost and could not be recreated";
+            return false;
+        }
+        s.track = nt;
+        if (currentReceiveSession.get() == s) audioTrack = nt;
+        try {
+            nt.play();
+        } catch (IllegalStateException e) {
+            s.failReason = "Audio output could not restart";
+            return false;
+        }
+        PipelineLog.i("TRACK_BUILD", "AudioTrack recreated after write error " + w);
+        return true;
+    }
+
     private void startReceiving(String streamerIp) {
+        final ReceiveSession session = new ReceiveSession();
+        ReceiveSession previous = currentReceiveSession.getAndSet(session);
+        if (previous != null) {
+            previous.running.set(false);
+            closeQuietly(previous.socket);
+            stopTrackQuietly(previous.track);
+        }
+
         isReceiving.set(true);
         totalBytesSent.set(0);
         bytesSentThisSecond.set(0);
@@ -2479,29 +3515,44 @@ public class MainActivity extends AppCompatActivity
 
             try {
                 socket = new Socket();
-                socket.setTcpNoDelay(true);
-                socket.setReceiveBufferSize(16384);
-                socket.setTrafficClass(0x10);
-                socket.connect(new InetSocketAddress(streamerIp, PORT), 5000);
+                // Published before connect() so stopReceiving() can abort a pending connect (FIX_PLAN #12)
+                session.socket = socket;
                 activeSocket = socket;
+                // Same LAN binding rule as M3's ping/chat clients (skips hotspot-subnet targets)
+                bindToLan(socket, streamerIp);
+                socket.setTcpNoDelay(SettingsFragment.isTcpNoDelay(MainActivity.this));
+                int bufMul = SettingsFragment.getSocketMultiplier(MainActivity.this);
+                // SO_RCVBUF deliberately not set: keep Linux receive-window autotuning (FIX_PLAN #16)
+                socket.setTrafficClass(0x10);
+                if (!session.running.get()) return;
+                int port = getActiveStreamPort();
+                PipelineLog.i("CONNECT", "connecting to "
+                        + PipelineLog.redactIps(streamerIp) + ":" + port);
+                socket.connect(new InetSocketAddress(streamerIp, port),
+                        SettingsFragment.getConnTimeoutMs(MainActivity.this));
+                socket.setSoTimeout(5000);
+                PipelineLog.i("CONNECT", "connected");
+                if (!session.running.get()) return;
 
-                rawIn = new BufferedInputStream(socket.getInputStream(), 16384);
+                rawIn = new BufferedInputStream(socket.getInputStream(), Math.max(16384, 8192 * bufMul));
                 AudioConfig config = readFormatHeader(rawIn);
                 if (config == null) {
-                    updateStatus("Invalid stream format");
+                    session.failReason = "Invalid stream format";
+                    PipelineLog.w("HDR_RX", "invalid header");
                     return;
                 }
                 activeConfig.set(config);
 
                 if (config.useFLAC && !FlacCodec.isFlacDecoderAvailable()) {
-                    updateStatus("FLAC decoder not available on this device");
+                    session.failReason = "FLAC decoder not available on this device";
                     return;
                 }
 
+                if (!session.running.get()) return;
                 updateReceivingUI(config, streamerIp);
                 updateReceiverNotification();
-                startPingClient(streamerIp);
-                startChatClient(streamerIp);
+                startPingClient(streamerIp, session);
+                startChatClient(streamerIp, session);
 
                 updateStatus(String.format(Locale.US,
                         "Receiving %s (%s %s %d-bit)",
@@ -2514,86 +3565,113 @@ public class MainActivity extends AppCompatActivity
                             config.sampleRate, config.channels,
                             config.bitsPerSample);
                     if (!flacDecoder.start()) {
-                        updateStatus("FLAC decoder failed to start");
+                        session.failReason = "FLAC decoder failed to start";
                         return;
                     }
                     Log.i(TAG, "FLAC lossless decoding enabled");
                     dataIn = new DataInputStream(rawIn);
                 }
 
+                int bytesPerFrame = config.channels * config.bytesPerSample;
                 int minBuf = AudioTrack.getMinBufferSize(
                         config.sampleRate, config.channelOutMask, config.encoding);
-                int playBuf = Math.max(minBuf, config.chunkSize * 2);
+                int playBuf = minBuf > 0
+                        ? Math.max(minBuf * bufMul, config.chunkSize * 2)
+                        : Math.max(config.chunkSize * 2, 32768);
+                playBuf = getCalculatedBufferSize(playBuf, bytesPerFrame);
+                session.playBuf = playBuf;
 
-                lt = new AudioTrack.Builder()
-                        .setAudioAttributes(new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                                .build())
-                        .setAudioFormat(new AudioFormat.Builder()
-                                .setEncoding(config.encoding)
-                                .setSampleRate(config.sampleRate)
-                                .setChannelMask(config.channelOutMask)
-                                .build())
-                        .setBufferSizeInBytes(playBuf)
-                        .setTransferMode(AudioTrack.MODE_STREAM)
-                        .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-                        .build();
-                audioTrack = lt;
+                lt = buildReceiveTrack(config, session);
+                if (lt == null) {
+                    session.failReason = String.format(Locale.US,
+                            "This phone can't play %s/%d-bit audio",
+                            config.sampleRateString(), config.bitsPerSample);
+                    PipelineLog.e("TRACK_BUILD", "AudioTrack fallback chain exhausted", null);
+                    return;
+                }
+                session.track = lt;
+                if (currentReceiveSession.get() == session) audioTrack = lt;
+                if (!session.running.get()) return;
                 lt.play();
 
                 streamStartTime.set(System.currentTimeMillis());
                 lastTimeMs.set(System.currentTimeMillis());
 
                 if (config.useFLAC) {
-                    receiveFlacLoop(dataIn, lt, flacDecoder, config);
+                    receiveFlacLoop(dataIn, session, flacDecoder, config);
                 } else {
-                    receivePcmLoop(rawIn, lt, config);
+                    receivePcmLoop(rawIn, session, config);
                 }
 
             } catch (java.net.ConnectException e) {
-                updateStatus("Cannot connect to " + streamerIp);
+                if (session.running.get()) {
+                    session.failReason = "Cannot connect to " + streamerIp;
+                    PipelineLog.w("CONNECT", "connect refused/failed: " + e.getClass().getSimpleName());
+                }
             } catch (SocketTimeoutException e) {
-                updateStatus("Connection timed out");
+                if (session.running.get()) {
+                    session.failReason = "Connection timed out";
+                    PipelineLog.w("CONNECT", "connect/header timeout");
+                }
+            } catch (java.io.EOFException e) {
+                if (session.running.get()) session.failReason = "Streamer closed the connection";
             } catch (IOException e) {
-                if (isReceiving.get()) {
+                if (session.running.get()) {
                     Log.e(TAG, "Receive error", e);
-                    updateStatus("Receive error: " + e.getMessage());
+                    session.failReason = "Receive error: " + e.getMessage();
                 }
             } catch (Exception e) {
-                if (isReceiving.get()) {
+                if (session.running.get()) {
                     Log.e(TAG, "Error", e);
-                    updateStatus("Error: " + e.getMessage());
+                    session.failReason = "Error: " + e.getMessage();
                 }
             } finally {
-                isReceiving.set(false);
-                stopPingClient();
-                stopChatClient();
+                session.running.set(false);
                 if (flacDecoder != null) flacDecoder.release();
-                cleanupTrack(lt);
-                audioTrack = null;
+                AudioTrack st = session.track;
+                // Clear the shared field first so UI-thread handlers don't touch a released track
+                if (st != null && audioTrack == st) audioTrack = null;
+                if (lt != null && audioTrack == lt) audioTrack = null;
+                cleanupTrack(st);
+                if (lt != null && lt != st) cleanupTrack(lt);
                 closeQuietly(rawIn);
                 closeQuietly(socket);
-                activeSocket = null;
-                stopReceiverService();
-                resetUI();
-                updateStatus("Receiving stopped");
+                if (activeSocket == socket) activeSocket = null;
+                // Only the session that is still current may reset shared state (FIX_PLAN #12)
+                if (currentReceiveSession.compareAndSet(session, null)) {
+                    isReceiving.set(false);
+                    stopPingClient();
+                    stopChatClient();
+                    stopReceiverService();
+                    resetUI();
+                    String reason = session.failReason;
+                    updateStatus(reason != null ? "Stopped: " + reason : "Receiving stopped");
+                }
             }
         }, "ReceiveThread");
         receiveThread.start();
     }
 
-    private void receiveFlacLoop(DataInputStream dataIn, AudioTrack track,
+    private void receiveFlacLoop(DataInputStream dataIn, ReceiveSession s,
                                  FlacCodec.Decoder decoder, AudioConfig config)
             throws IOException {
 
         byte[] compressedBuf = new byte[config.chunkSize];
 
-        while (isReceiving.get()) {
-            int frameLen = dataIn.readInt();
+        while (s.running.get() && isReceiving.get()) {
+            int frameLen;
+            try {
+                frameLen = dataIn.readInt();
+            } catch (SocketTimeoutException te) {
+                if (tolerateReadTimeout(s)) continue;
+                break;
+            }
+            s.readTimeouts = 0;
             if (frameLen <= 0 || frameLen > config.chunkSize * 2) {
+                // No resync marker in the stream: continuing would desync forever
                 Log.w(TAG, "Invalid FLAC frame length: " + frameLen);
-                continue;
+                s.failReason = "Corrupt FLAC stream";
+                break;
             }
 
             if (compressedBuf.length < frameLen) {
@@ -2603,8 +3681,8 @@ public class MainActivity extends AppCompatActivity
             dataIn.readFully(compressedBuf, 0, frameLen);
 
             byte[] pcmData = decoder.decode(compressedBuf, frameLen);
-            if (pcmData != null && pcmData.length > 0) {
-                track.write(pcmData, 0, pcmData.length);
+            if (pcmData != null && pcmData.length > 0 && !isPaused.get() && s.running.get()) {
+                if (!writeToReceiveTrack(s, config, pcmData, pcmData.length)) break;
             }
 
             totalBytesSent.addAndGet(frameLen);
@@ -2622,26 +3700,39 @@ public class MainActivity extends AppCompatActivity
         }
     }
 
-    private void receivePcmLoop(InputStream in, AudioTrack track,
+    private void receivePcmLoop(InputStream in, ReceiveSession s,
                                 AudioConfig config) throws IOException {
 
         byte[] buffer = new byte[config.chunkSize];
 
-        while (isReceiving.get()) {
+        while (s.running.get() && isReceiving.get()) {
             int totalRead = 0;
-            while (totalRead < buffer.length && isReceiving.get()) {
-                int read = in.read(buffer, totalRead,
-                        buffer.length - totalRead);
-                if (read == -1) {
-                    if (isReceiving.get()) updateStatus("Streamer disconnected");
-                    isReceiving.set(false);
+            boolean end = false;
+            while (totalRead < buffer.length && s.running.get()) {
+                int read;
+                try {
+                    read = in.read(buffer, totalRead,
+                            buffer.length - totalRead);
+                } catch (SocketTimeoutException te) {
+                    // 5 s without data: fine while paused / ping alive, else give up (FIX_PLAN #16)
+                    if (tolerateReadTimeout(s)) continue;
+                    end = true;
                     break;
                 }
+                if (read == -1) {
+                    if (s.running.get()) s.failReason = "Streamer disconnected";
+                    end = true;
+                    break;
+                }
+                s.readTimeouts = 0;
                 totalRead += read;
             }
+            if (end) break;
 
-            if (totalRead == buffer.length && isReceiving.get()) {
-                track.write(buffer, 0, totalRead);
+            if (totalRead == buffer.length && s.running.get()) {
+                if (!isPaused.get()) {
+                    if (!writeToReceiveTrack(s, config, buffer, totalRead)) break;
+                }
                 totalBytesSent.addAndGet(totalRead);
                 bytesSentThisSecond.addAndGet(totalRead);
 
@@ -2661,6 +3752,13 @@ public class MainActivity extends AppCompatActivity
     private void stopReceiving() {
         if (!isReceiving.compareAndSet(true, false)) return;
         updateStatus("Stopping...");
+        ReceiveSession rs = currentReceiveSession.get();
+        if (rs != null) {
+            rs.running.set(false);
+            closeQuietly(rs.socket);           // also aborts a pending connect()
+            stopTrackQuietly(rs.track);        // unblocks a pending AudioTrack.write()
+        }
+        stopTrackQuietly(audioTrack);
         stopPingClient();
         stopChatClient();
         Socket s = activeSocket;
@@ -2671,32 +3769,45 @@ public class MainActivity extends AppCompatActivity
         stopReceiverService();
     }
 
+    /** pause+flush+stop without releasing; used to unblock a writer thread. */
+    private void stopTrackQuietly(AudioTrack t) {
+        if (t == null) return;
+        try { t.pause(); } catch (Exception ignored) {}
+        try { t.flush(); } catch (Exception ignored) {}
+        try { t.stop(); } catch (Exception ignored) {}
+    }
+
     // ---------- SERVICE HELPERS ----------
 
+    // AudioReceiveService.start/stop defer a stop that races an in-flight startForegroundService
+    // (FIX_PLAN #8); stop(ctx, mode) only stops the service if it runs in that mode.
     private void startReceiverService() {
-        try {
-            Intent svc = new Intent(this, AudioReceiveService.class);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(svc);
-            } else {
-                startService(svc);
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "Failed to start receiver service: " + e.getMessage());
+        if (!AudioReceiveService.start(this, AudioReceiveService.MODE_RECEIVE)) {
+            Log.w(TAG, "Failed to start receiver service");
         }
     }
 
     private void stopReceiverService() {
-        try {
-            stopService(new Intent(this, AudioReceiveService.class));
-        } catch (Exception ignored) {
+        AudioReceiveService.stop(this, AudioReceiveService.MODE_RECEIVE);
+    }
+
+    /** FIX_PLAN #14: keep File Share sync playback in a mediaPlayback FGS. Call from a user tap. */
+    private void startFileShareService() {
+        if (!AudioReceiveService.start(this, AudioReceiveService.MODE_FILESHARE)) {
+            Log.w(TAG, "Failed to start file share service");
         }
+    }
+
+    private void stopFileShareService() {
+        AudioReceiveService.stop(this, AudioReceiveService.MODE_FILESHARE);
     }
 
     // ---------- CLEANUP ----------
     private void stopForegroundService() {
         try {
-            stopService(new Intent(this, AudioCaptureService.class));
+            if (AudioCaptureService.stop(this)) {   // deferred while a start is in flight
+                PipelineLog.i("FGS_STOP", "capture service stop requested");
+            }
         } catch (Exception ignored) {
         }
     }
@@ -2775,6 +3886,21 @@ public class MainActivity extends AppCompatActivity
     }
 
     @Override
+    public void onDuplexTogglePlayPause() {
+        togglePlayPause();
+    }
+
+    @Override
+    public void onDuplexSkipPrev() {
+        onSkipPrevious();
+    }
+
+    @Override
+    public void onDuplexSkipNext() {
+        onSkipNext();
+    }
+
+    @Override
     public void onDuplexChatSend(String message) {
         if (!isDuplexActive.get() || duplexChatOut == null) return;
         String senderName = SettingsFragment.getClientName(this);
@@ -2802,10 +3928,16 @@ public class MainActivity extends AppCompatActivity
             duplexFragment.updateStatus("Requires Android 10+");
             return;
         }
+        String other = activeOtherMode("Duplex");
+        if (other != null) {
+            duplexFragment.updateStatus(modeBusyMessage(other));
+            return;
+        }
         if (!hasRecordAudioPermission()) {
+            pendingAudioPermAction = "duplex_host";
             ActivityCompat.requestPermissions(this,
                     new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
-            return;
+            return; // continues in onRequestPermissionsResult
         }
         isDuplexActive.set(true);
         duplexFragment.setActive(true);
@@ -2823,10 +3955,17 @@ public class MainActivity extends AppCompatActivity
             duplexFragment.updateStatus("Requires Android 10+");
             return;
         }
+        String other = activeOtherMode("Duplex");
+        if (other != null) {
+            duplexFragment.updateStatus(modeBusyMessage(other));
+            return;
+        }
         if (!hasRecordAudioPermission()) {
+            pendingAudioPermAction = "duplex_join";
+            pendingDuplexJoinIp = ip;
             ActivityCompat.requestPermissions(this,
                     new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
-            return;
+            return; // continues in onRequestPermissionsResult
         }
         isDuplexActive.set(true);
         duplexFragment.setActive(true);
@@ -2848,6 +3987,7 @@ public class MainActivity extends AppCompatActivity
                 duplexServerSocket = new ServerSocket(DUPLEX_PORT);
                 duplexServerSocket.setSoTimeout(0);
                 Socket client = duplexServerSocket.accept();
+                client.setTcpNoDelay(SettingsFragment.isTcpNoDelay(MainActivity.this));
                 String peerIp = client.getInetAddress().getHostAddress();
                 mainHandler.post(() -> {
                     duplexFragment.updateStatus("Connected to " + peerIp);
@@ -2878,6 +4018,8 @@ public class MainActivity extends AppCompatActivity
         new Thread(() -> {
             try {
                 Socket socket = new Socket();
+                bindToLan(socket, ip);
+                socket.setTcpNoDelay(SettingsFragment.isTcpNoDelay(MainActivity.this));
                 socket.connect(new InetSocketAddress(ip, DUPLEX_PORT),
                         SettingsFragment.getConnTimeoutMs(this));
                 mainHandler.post(() -> {
@@ -2933,7 +4075,25 @@ public class MainActivity extends AppCompatActivity
 
         // Send thread — capture system audio to socket
         duplexSendThread = new Thread(() -> {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
+            AudioRecord rec = null;
             try {
+                Thread.sleep(200);
+                if (!isDuplexActive.get() || socket.isClosed()) return;
+
+                // Send the 6-byte header FIRST (format is fixed), so the peer never blocks on it
+                // if our capture fails (FIX_PLAN #24): sampleRate(4) + channels(1) + encoding(1)
+                OutputStream out = socket.getOutputStream();
+                byte[] header = new byte[6];
+                header[0] = (byte) ((sampleRate >> 24) & 0xFF);
+                header[1] = (byte) ((sampleRate >> 16) & 0xFF);
+                header[2] = (byte) ((sampleRate >> 8) & 0xFF);
+                header[3] = (byte) (sampleRate & 0xFF);
+                header[4] = (byte) channels;
+                header[5] = (byte) encoding;
+                out.write(header);
+                out.flush();
+
                 AudioPlaybackCaptureConfiguration captureConfig =
                         new AudioPlaybackCaptureConfiguration.Builder(duplexProjection)
                                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
@@ -2947,38 +4107,53 @@ public class MainActivity extends AppCompatActivity
                         .setChannelMask(channelInMask)
                         .build();
 
-                duplexRecorder = new AudioRecord.Builder()
-                        .setAudioFormat(fmt)
-                        .setBufferSizeInBytes(recBuf)
-                        .setAudioPlaybackCaptureConfig(captureConfig)
-                        .build();
-
-                if (duplexRecorder.getState() != AudioRecord.STATE_INITIALIZED) {
-                    mainHandler.post(() ->
-                            duplexFragment.updateStatus("AudioRecord init failed"));
+                try {
+                    rec = new AudioRecord.Builder()
+                            .setAudioFormat(fmt)
+                            .setBufferSizeInBytes(recBuf)
+                            .setAudioPlaybackCaptureConfig(captureConfig)
+                            .build();
+                } catch (UnsupportedOperationException | IllegalArgumentException e) {
+                    PipelineLog.w("CAPTURE_OPEN", "duplex 48000Hz 16bit 2ch rejected: "
+                            + e.getClass().getSimpleName());
+                    rec = null;
+                }
+                if (rec == null || rec.getState() != AudioRecord.STATE_INITIALIZED) {
+                    PipelineLog.w("CAPTURE_OPEN", "duplex AudioRecord init failed");
+                    // Connection stays up: we still hear the peer, the peer just gets no audio from us
+                    mainHandler.post(() -> duplexFragment.updateStatus(
+                            "Capture failed on this phone — you can still hear the other side"));
                     return;
                 }
-                duplexRecorder.startRecording();
+                duplexRecorder = rec;
+                rec.startRecording();
+                PipelineLog.i("CAPTURE_OPEN", "duplex 48000Hz 16bit 2ch ok");
 
-                OutputStream out = socket.getOutputStream();
-                // Send header: sampleRate(4) + channels(1) + encoding(1)
-                byte[] header = new byte[6];
-                header[0] = (byte) ((sampleRate >> 24) & 0xFF);
-                header[1] = (byte) ((sampleRate >> 16) & 0xFF);
-                header[2] = (byte) ((sampleRate >> 8) & 0xFF);
-                header[3] = (byte) (sampleRate & 0xFF);
-                header[4] = (byte) channels;
-                header[5] = (byte) encoding;
-                out.write(header);
-                out.flush();
-
+                int bytesPerFrame = channels * bytesPerSample;
                 int chunkSize = Math.max(minRecBuf, 4096);
+                chunkSize = (chunkSize / bytesPerFrame) * bytesPerFrame;
                 byte[] buffer = new byte[chunkSize];
+                int errorReads = 0;
+                int deadReads = 0;
                 while (isDuplexActive.get() && !socket.isClosed()) {
-                    int read = duplexRecorder.read(buffer, 0, buffer.length);
+                    int read = rec.read(buffer, 0, buffer.length);
                     if (read > 0) {
+                        deadReads = 0;
                         out.write(buffer, 0, read);
                         duplexBytesSent.addAndGet(read);
+                    } else {
+                        // Never spin on error codes (FIX_PLAN #24)
+                        if (read < 0) {
+                            if (errorReads++ % 100 == 0) {
+                                PipelineLog.w("READ_ERR", "duplex AudioRecord.read=" + read);
+                            }
+                            if (read == AudioRecord.ERROR_DEAD_OBJECT && ++deadReads >= 5) {
+                                mainHandler.post(() -> duplexFragment.updateStatus(
+                                        "Audio capture lost (audio system error)"));
+                                break;
+                            }
+                        }
+                        Thread.sleep(10);
                     }
                 }
             } catch (Exception e) {
@@ -2987,13 +4162,14 @@ public class MainActivity extends AppCompatActivity
                             duplexFragment.updateStatus("Send error: " + e.getMessage()));
                 }
             } finally {
-                cleanupRecorder(duplexRecorder);
-                duplexRecorder = null;
+                if (rec != null && duplexRecorder == rec) duplexRecorder = null;
+                cleanupRecorder(rec);
             }
         }, "DuplexSend");
 
         // Receive thread — socket to speaker
         duplexRecvThread = new Thread(() -> {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
             try {
                 InputStream in = socket.getInputStream();
                 byte[] header = new byte[6];
@@ -3013,11 +4189,12 @@ public class MainActivity extends AppCompatActivity
                 int bytesPerSec = remoteSR * remoteCh * remoteBPS;
                 int remoteOutMask = (remoteCh == 1)
                         ? AudioFormat.CHANNEL_OUT_MONO : AudioFormat.CHANNEL_OUT_STEREO;
-                int remotePlayBuf = AudioTrack.getMinBufferSize(
+                int remoteMinBuf = AudioTrack.getMinBufferSize(
                         remoteSR, remoteOutMask, remoteEnc);
                 int halfSec = bytesPerSec / 2;
-                remotePlayBuf = Math.max(
-                        Math.max(remotePlayBuf * bufMul, halfSec), 4096);
+                int remotePlayBuf = Math.max(
+                        Math.max(remoteMinBuf * bufMul, halfSec), 4096);
+                remotePlayBuf = getCalculatedBufferSize(remotePlayBuf);
 
                 AudioTrack track = new AudioTrack.Builder()
                         .setAudioAttributes(new AudioAttributes.Builder()
@@ -3033,6 +4210,7 @@ public class MainActivity extends AppCompatActivity
                                 .build())
                         .setBufferSizeInBytes(remotePlayBuf)
                         .setTransferMode(AudioTrack.MODE_STREAM)
+                        .setPerformanceMode(getAudioPerformanceMode())
                         .build();
                 duplexTrack = track;
                 track.play();
@@ -3041,16 +4219,42 @@ public class MainActivity extends AppCompatActivity
                         remoteSR / 1000.0);
                 String chStr = remoteCh == 1 ? "Mono" : "Stereo";
 
-                byte[] buffer = new byte[remotePlayBuf];
+                int bytesPerFrame = remoteCh * remoteBPS;
+                int recvChunkSize = Math.max(remoteMinBuf, 4096);
+                recvChunkSize = (recvChunkSize / bytesPerFrame) * bytesPerFrame;
+                byte[] buffer = new byte[recvChunkSize];
+
                 while (isDuplexActive.get() && !socket.isClosed()) {
-                    int read = in.read(buffer, 0, buffer.length);
-                    if (read < 0) break;
-                    track.write(buffer, 0, read);
-                    duplexBytesRecv.addAndGet(read);
+                    int totalRead = 0;
+                    while (totalRead < buffer.length && isDuplexActive.get() && !socket.isClosed()) {
+                        int read = in.read(buffer, totalRead, buffer.length - totalRead);
+                        if (read < 0) {
+                            break;
+                        }
+                        totalRead += read;
+                    }
+                    if (totalRead <= 0) break;
+
+                    int alignedBytes = (totalRead / bytesPerFrame) * bytesPerFrame;
+                    if (alignedBytes > 0) {
+                        if (!isPaused.get()) {
+                            if (remoteEnc != AudioFormat.ENCODING_PCM_FLOAT) {
+                                AudioPipelineUtils.applyDsp(buffer, 0, alignedBytes,
+                                        SettingsFragment.getAudioGainMultiplier(MainActivity.this),
+                                        SettingsFragment.getChannelMode(MainActivity.this),
+                                        remoteBPS, remoteCh);
+                            }
+                            int w = track.write(buffer, 0, alignedBytes);
+                            if (w < 0 && isDuplexActive.get() && !isPaused.get()) {
+                                PipelineLog.w("WRITE_ERR", "duplex AudioTrack.write=" + w);
+                            }
+                        }
+                        duplexBytesRecv.addAndGet(alignedBytes);
+                    }
 
                     // Update stats periodically
                     long elapsed = System.currentTimeMillis() - duplexStartTime.get();
-                    if (elapsed > 0 && (duplexBytesRecv.get() % (remotePlayBuf * 4L)) < read) {
+                    if (elapsed > 0 && (duplexBytesRecv.get() % (remotePlayBuf * 4L)) < alignedBytes) {
                         long sentKbps = (duplexBytesSent.get() * 8) / elapsed;
                         long recvKbps = (duplexBytesRecv.get() * 8) / elapsed;
                         long secs = elapsed / 1000;
@@ -3064,7 +4268,7 @@ public class MainActivity extends AppCompatActivity
                                 remoteSR / 1000.0);
                         chStr = remoteCh == 1 ? "Mono" : "Stereo";
 
-                        // Get metadata — use SAME path as updateDuplexNotificationNow
+                        // Get metadata — ONLY show remote peer's metadata, never local media
                         String npTitle, npSub;
                         Bitmap npArt;
                         long durMs, posMs;
@@ -3077,34 +4281,12 @@ public class MainActivity extends AppCompatActivity
                             npArt = duplexRemoteArt;
                             durMs = duplexRemoteDurationMs;
                             posMs = duplexRemotePositionMs;
-
-                            // Remote has no art? Try local lookup
-                            if (npArt == null) {
-                                MediaMetadataHelper.NowPlayingInfo local =
-                                        MediaMetadataHelper.getCurrentMedia(
-                                                MainActivity.this);
-                                if (local != null && local.albumArt != null) {
-                                    npArt = local.albumArt;
-                                }
-                            }
                         } else {
-                            // Use local media (getBestAlbumArt runs inside)
-                            MediaMetadataHelper.NowPlayingInfo media =
-                                    MediaMetadataHelper.getCurrentMedia(
-                                            MainActivity.this);
-                            if (media != null && !"Unknown".equals(media.title)) {
-                                npTitle = media.title;
-                                npSub = media.getSubtitle();
-                                npArt = media.albumArt;
-                                durMs = media.durationMs;
-                                posMs = media.positionMs;
-                            } else {
-                                npTitle = srStr + " Duplex Stream";
-                                npSub = chStr + " · 16-bit · Full Duplex";
-                                npArt = null;
-                                durMs = 0;
-                                posMs = 0;
-                            }
+                            npTitle = srStr + " Duplex Stream";
+                            npSub = chStr + " · 16-bit · Full Duplex";
+                            npArt = null;
+                            durMs = 0;
+                            posMs = 0;
                         }
 
                         final String fT = npTitle, fS = npSub;
@@ -3203,7 +4385,7 @@ public class MainActivity extends AppCompatActivity
         Bitmap art = null;
         long durMs = 0, posMs = 0;
 
-        // 1. Remote peer metadata (has art sent over network)
+        // ONLY show remote peer's metadata, never local media
         if (duplexRemoteTitle != null && !duplexRemoteTitle.isEmpty()
                 && !"Unknown".equals(duplexRemoteTitle)) {
             title = duplexRemoteTitle;
@@ -3211,30 +4393,12 @@ public class MainActivity extends AppCompatActivity
             art = duplexRemoteArt;
             durMs = duplexRemoteDurationMs;
             posMs = duplexRemotePositionMs;
-
-            // If remote sent no art, try to find it locally by title/artist
-            if (art == null) {
-                MediaMetadataHelper.NowPlayingInfo localLookup =
-                        MediaMetadataHelper.getCurrentMedia(this);
-                if (localLookup != null && localLookup.albumArt != null) {
-                    art = localLookup.albumArt;
-                }
-            }
         } else {
-            // 2. Local music player (uses getBestAlbumArt with all 4 sources)
-            MediaMetadataHelper.NowPlayingInfo media =
-                    MediaMetadataHelper.getCurrentMedia(this);
-            if (media != null && !"Unknown".equals(media.title)) {
-                title = media.title;
-                subtitle = media.getSubtitle();
-                art = media.albumArt;
-                durMs = media.durationMs;
-                posMs = media.positionMs;
-            } else {
-                // 3. Fallback
-                title = "Full Duplex Stream";
-                subtitle = "48.0 kHz · Stereo · 16-bit";
-            }
+            title = "Full Duplex Stream";
+            subtitle = "48.0 kHz · Stereo · 16-bit";
+            art = null;
+            durMs = 0;
+            posMs = 0;
         }
 
         AudioCaptureService.updateNotification(
@@ -3269,7 +4433,12 @@ public class MainActivity extends AppCompatActivity
     private void startDuplexMetadataBroadcast() {
         duplexMetadataThread = new Thread(() -> {
             try {
-                String lastTitle = "";
+                // FIX_PLAN #15: poll every 3 s, but write only on change or every 15 s.
+                // Art is encoded once per change (≤512 px, q80) and re-sent with every
+                // message, because artLen 0 clears the peer's art.
+                String lastKey = null;
+                long lastSentMs = 0;
+                byte[] cachedArt = null;
                 while (isDuplexActive.get()) {
                     DataOutputStream out = duplexChatOut;
                     if (out == null || !isDuplexActive.get()) break;
@@ -3287,35 +4456,23 @@ public class MainActivity extends AppCompatActivity
                         long durationMs = media.durationMs;
                         long positionMs = media.positionMs;
 
-                        boolean trackChanged = !title.equals(lastTitle);
-
-                        // Only send album art on track change to save bandwidth
-                        byte[] artBytes = null;
-                        if (media.albumArt != null && trackChanged) {
-                            try {
-                                int origW = media.albumArt.getWidth();
-                                Bitmap toSend;
-                                if (origW >= 1024) {
-                                    toSend = Bitmap.createScaledBitmap(
-                                            media.albumArt, 1024, 1024, true);
-                                } else if (origW >= 512) {
-                                    toSend = media.albumArt;
-                                } else {
-                                    toSend = Bitmap.createScaledBitmap(
-                                            media.albumArt, 512, 512, true);
-                                }
-                                java.io.ByteArrayOutputStream bos =
-                                        new java.io.ByteArrayOutputStream();
-                                toSend.compress(
-                                        Bitmap.CompressFormat.JPEG, 95, bos);
-                                artBytes = bos.toByteArray();
-                            } catch (Exception ignored) {}
+                        Bitmap srcArt = media.albumArt;
+                        String key = title + '\u0000' + artist + '\u0000' + album + '\u0000'
+                                + (srcArt == null ? "-" : srcArt.getWidth() + "x" + srcArt.getHeight());
+                        long now = android.os.SystemClock.elapsedRealtime();
+                        boolean changed = !key.equals(lastKey);
+                        if (!changed && now - lastSentMs < META_REFRESH_MS) {
+                            Thread.sleep(3000);
+                            continue;
                         }
+                        if (changed) cachedArt = encodeMetadataArt(srcArt);
+                        byte[] artBytes = cachedArt;
 
                         try {
                             writeMetadataMessage(out, title, artist, album,
                                     artBytes, durationMs, positionMs);
-                            lastTitle = title;
+                            lastKey = key;
+                            lastSentMs = now;
                         } catch (IOException e) {
                             Log.w(TAG, "Duplex metadata error: "
                                     + e.getMessage());
@@ -3348,6 +4505,7 @@ public class MainActivity extends AppCompatActivity
                     for (int retry = 0; retry < 3 && isDuplexActive.get(); retry++) {
                         try {
                             chatSock = new Socket();
+                            bindToLan(chatSock, peerIp);
                             chatSock.connect(new InetSocketAddress(peerIp, DUPLEX_CHAT_PORT),
                                     SettingsFragment.getConnTimeoutMs(this));
                             break;
@@ -3394,11 +4552,15 @@ public class MainActivity extends AppCompatActivity
                         long posMs = duplexChatIn.readLong();
                         int artLen = duplexChatIn.readInt();
                         Bitmap art = null;
-                        if (artLen > 0 && artLen < 1_500_000) {
+                        if (artLen < 0) throw new IOException("Bad art length");
+                        if (artLen > 0 && artLen < META_ART_MAX_BYTES) {
                             byte[] artBytes = new byte[artLen];
                             duplexChatIn.readFully(artBytes);
                             art = android.graphics.BitmapFactory.decodeByteArray(
                                     artBytes, 0, artLen);
+                        } else if (artLen > 0) {
+                            // Oversized art: consume it so the chat stream stays in sync (FIX_PLAN #15).
+                            skipFully(duplexChatIn, artLen);
                         }
                         String metaSub = artist;
                         if (album != null && !album.isEmpty()) {
@@ -3423,13 +4585,28 @@ public class MainActivity extends AppCompatActivity
                         });
                     } else if (cmd == CTRL_PAUSE) {
                         mainHandler.post(() -> {
+                            isPaused.set(true);
+                            updatePlayPauseButton(true);
                             AudioTrack dt = duplexTrack;
                             if (dt != null) { try { dt.pause(); } catch (Exception ignored) {} }
+                            // No media-key fallback in duplex: it would loop back into our own
+                            // session (FIX_PLAN #9, request from M4).
+                            MediaMetadataHelper.sendPause(MainActivity.this, false);
+                            updateDuplexNotificationNow();
                         });
                     } else if (cmd == CTRL_RESUME) {
                         mainHandler.post(() -> {
+                            isPaused.set(false);
+                            updatePlayPauseButton(false);
                             AudioTrack dt = duplexTrack;
-                            if (dt != null) { try { dt.play(); } catch (Exception ignored) {} }
+                            if (dt != null) {
+                                try {
+                                    dt.flush();
+                                    dt.play();
+                                } catch (Exception ignored) {}
+                            }
+                            MediaMetadataHelper.sendPlay(MainActivity.this, false);   // FIX_PLAN #9
+                            updateDuplexNotificationNow();
                         });
                     } else if (cmd == CTRL_SKIP_FWD) {
                         MediaMetadataHelper.sendSkipNext(MainActivity.this);
@@ -3520,66 +4697,164 @@ public class MainActivity extends AppCompatActivity
 
     private void scanForHost(String queryMsg, String expectedPrefix,
                              java.util.function.Consumer<String> onFound, Runnable onNotFound) {
+        // FIX_PLAN #4: 4 rounds to 255.255.255.255 + every up IPv4 subnet broadcast, socket
+        // bound to the LAN network, replies drained (non-matching ones ignored) until ~3 s.
+        // Wire format unchanged: same query strings, port 5007, host = reply source address.
         new Thread(() -> {
-            DatagramSocket scanSocket = null;
+            List<DatagramSocket> socks = new ArrayList<>();
             try {
-                scanSocket = new DatagramSocket();
-                scanSocket.setBroadcast(true);
-                scanSocket.setSoTimeout(2500);
-
                 byte[] reqBytes = queryMsg.getBytes(StandardCharsets.UTF_8);
-                DatagramPacket sendPacket = new DatagramPacket(
-                        reqBytes, reqBytes.length,
-                        InetAddress.getByName("255.255.255.255"), FILE_DISCOVERY_PORT);
-                scanSocket.send(sendPacket);
+                List<InetAddress> lanTargets = new ArrayList<>();
+                List<InetAddress> otherTargets = new ArrayList<>();
+                lanTargets.add(InetAddress.getByName("255.255.255.255"));
+                collectSubnetBroadcasts(lanTargets, otherTargets);
+
+                DatagramSocket primary = new DatagramSocket();
+                socks.add(primary);
+                primary.setBroadcast(true);
+                bindToLan(primary);
+                DatagramSocket secondary = null;
+                if (lanNetwork != null && !otherTargets.isEmpty()) {
+                    // e.g. hotspot (ap0) subnet while also on Wi-Fi: only reachable unbound.
+                    secondary = new DatagramSocket();
+                    socks.add(secondary);
+                    secondary.setBroadcast(true);
+                } else {
+                    lanTargets.addAll(otherTargets);
+                }
+                for (DatagramSocket s : socks) s.setSoTimeout(100);
+                PipelineLog.i("DISCOVERY", queryMsg + ": " + (lanTargets.size() + otherTargets.size())
+                        + " target(s), bound=" + (lanNetwork != null));
 
                 byte[] recvBuf = new byte[256];
-                DatagramPacket recvPacket = new DatagramPacket(recvBuf, recvBuf.length);
-                scanSocket.receive(recvPacket);
-
-                String resp = new String(recvPacket.getData(), 0, recvPacket.getLength(), StandardCharsets.UTF_8);
-                if (resp.startsWith(expectedPrefix)) {
-                    String hostIp = recvPacket.getAddress().getHostAddress();
-                    if (onFound != null) onFound.accept(hostIp);
-                    return;
+                long start = android.os.SystemClock.elapsedRealtime();
+                long deadline = start + 3000;
+                int rounds = 0;
+                while (android.os.SystemClock.elapsedRealtime() < deadline) {
+                    if (rounds < 4 && android.os.SystemClock.elapsedRealtime() >= start + rounds * 700L) {
+                        sendDiscoveryProbes(primary, reqBytes, lanTargets);
+                        if (secondary != null) sendDiscoveryProbes(secondary, reqBytes, otherTargets);
+                        rounds++;
+                    }
+                    for (DatagramSocket s : socks) {
+                        DatagramPacket recvPacket = new DatagramPacket(recvBuf, recvBuf.length);
+                        try {
+                            s.receive(recvPacket);
+                        } catch (SocketTimeoutException t) {
+                            continue;
+                        }
+                        String resp = new String(recvPacket.getData(), 0,
+                                recvPacket.getLength(), StandardCharsets.UTF_8);
+                        if (resp.startsWith(expectedPrefix)) {
+                            String hostIp = recvPacket.getAddress().getHostAddress();
+                            PipelineLog.i("DISCOVERY", "Found host " + PipelineLog.redactIps(hostIp)
+                                    + " after " + (android.os.SystemClock.elapsedRealtime() - start) + " ms");
+                            if (onFound != null) onFound.accept(hostIp);
+                            return;
+                        }
+                        // Stray/other-mode reply: ignore and keep waiting.
+                    }
                 }
-                if (onNotFound != null) onNotFound.run();
-            } catch (SocketTimeoutException e) {
+                PipelineLog.w("DISCOVERY", queryMsg + ": no host found after " + rounds + " round(s)");
                 if (onNotFound != null) onNotFound.run();
             } catch (Exception e) {
-                Log.e(TAG, "Scan error: " + e.getMessage(), e);
+                PipelineLog.e("DISCOVERY", "Scan error", e);
                 if (onNotFound != null) onNotFound.run();
             } finally {
-                if (scanSocket != null) {
-                    try { scanSocket.close(); } catch (Exception ignored) {}
+                for (DatagramSocket s : socks) {
+                    try { s.close(); } catch (Exception ignored) {}
                 }
             }
         }, "UniversalScanner").start();
     }
 
+    private void sendDiscoveryProbes(DatagramSocket s, byte[] req, List<InetAddress> targets) {
+        for (InetAddress t : targets) {
+            try {
+                s.send(new DatagramPacket(req, req.length, t, FILE_DISCOVERY_PORT));
+            } catch (IOException e) {
+                PipelineLog.d("DISCOVERY", "send to " + PipelineLog.redactIps(t.getHostAddress())
+                        + " failed: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Subnet broadcast addresses of up IPv4 interfaces that NetUtils considers LAN-capable
+     * (cellular/VPN/CLAT excluded). The tracked LAN interface's broadcast goes to
+     * {@code lanOut}, every other one (e.g. hotspot ap0/swlan0) to {@code otherOut}.
+     */
+    private void collectSubnetBroadcasts(List<InetAddress> lanOut, List<InetAddress> otherOut) {
+        String lanIface = null;
+        try {
+            Network lan = lanNetwork;
+            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            if (lan != null && cm != null) {
+                LinkProperties lp = cm.getLinkProperties(lan);
+                if (lp != null) lanIface = lp.getInterfaceName();
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            java.util.Enumeration<NetworkInterface> ifs = NetworkInterface.getNetworkInterfaces();
+            if (ifs == null) return;
+            for (NetworkInterface ni : Collections.list(ifs)) {
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                for (InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                    InetAddress a = ia.getAddress();
+                    InetAddress bc = ia.getBroadcast();
+                    if (!(a instanceof Inet4Address) || bc == null) continue;
+                    List<NetUtils.Candidate> one = Collections.singletonList(
+                            new NetUtils.Candidate(ni.getName(), a.getHostAddress()));
+                    if (NetUtils.rankIpv4Candidates(one).isEmpty()) continue;   // not a LAN iface
+                    List<InetAddress> dst = (lanIface == null || lanIface.equals(ni.getName()))
+                            ? lanOut : otherOut;
+                    if (!dst.contains(bc)) dst.add(bc);
+                }
+            }
+        } catch (Exception e) {
+            PipelineLog.w("DISCOVERY", "Interface enumeration failed: " + e);
+        }
+    }
+
     private void startUniversalDiscoveryServer(String mode) {
         activeDiscoveryHostMode = mode;
-        if (discoveryThread != null && discoveryThread.isAlive()) return;
+        acquireDiscoveryMulticastLock();   // FIX_PLAN #4: otherwise Wi-Fi firmware drops the broadcasts
+        // stopDiscoveryServer() nulls discoveryThread, so a just-stopped (still exiting)
+        // thread no longer prevents a restart.
+        Thread existing = discoveryThread;
+        if (existing != null && existing.isAlive()) return;
 
         discoveryThread = new Thread(() -> {
+            DatagramSocket ds = null;
             try {
-                discoverySocket = new DatagramSocket(FILE_DISCOVERY_PORT);
+                ds = new DatagramSocket(null);
+                ds.setReuseAddress(true);
+                ds.bind(new InetSocketAddress(FILE_DISCOVERY_PORT));
+                if (discoveryThread != Thread.currentThread()) return;   // superseded/stopped
+                discoverySocket = ds;
+                PipelineLog.i("DISCOVERY", "Discovery server listening on " + FILE_DISCOVERY_PORT);
                 byte[] buffer = new byte[256];
-                while (activeDiscoveryHostMode != null) {
+                while (activeDiscoveryHostMode != null && discoveryThread == Thread.currentThread()) {
                     DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                    discoverySocket.receive(packet);
+                    ds.receive(packet);
 
                     String msg = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8).trim();
+                    String hostMode = activeDiscoveryHostMode;
+                    if (hostMode == null || !msg.startsWith("SS_DISCOVER_")) continue;
+                    // Payload IP is informational (parsers use the packet source); use the
+                    // LAN-aware address instead of a possibly stale "Loading..." cache.
+                    String myIp = getDeviceIpAddress();
                     String replyMsg = null;
 
-                    if ("SS_DISCOVER_STREAM".equals(msg) && "STREAM".equals(activeDiscoveryHostMode)) {
-                        replyMsg = "SS_HOST_STREAM:" + cachedDeviceIp;
-                    } else if ("SS_DISCOVER_DUPLEX".equals(msg) && "DUPLEX".equals(activeDiscoveryHostMode)) {
-                        replyMsg = "SS_HOST_DUPLEX:" + cachedDeviceIp;
-                    } else if ("SS_DISCOVER_FILE".equals(msg) && "FILE".equals(activeDiscoveryHostMode)) {
-                        replyMsg = "SS_HOST_FILE:" + cachedDeviceIp;
-                    } else if ("SS_DISCOVER_ALL".equals(msg) && activeDiscoveryHostMode != null) {
-                        replyMsg = "SS_HOST_" + activeDiscoveryHostMode + ":" + cachedDeviceIp;
+                    if ("SS_DISCOVER_STREAM".equals(msg) && "STREAM".equals(hostMode)) {
+                        replyMsg = "SS_HOST_STREAM:" + myIp;
+                    } else if ("SS_DISCOVER_DUPLEX".equals(msg) && "DUPLEX".equals(hostMode)) {
+                        replyMsg = "SS_HOST_DUPLEX:" + myIp;
+                    } else if ("SS_DISCOVER_FILE".equals(msg) && "FILE".equals(hostMode)) {
+                        replyMsg = "SS_HOST_FILE:" + myIp;
+                    } else if ("SS_DISCOVER_ALL".equals(msg)) {
+                        replyMsg = "SS_HOST_" + hostMode + ":" + myIp;
                     }
 
                     if (replyMsg != null) {
@@ -3587,16 +4862,23 @@ public class MainActivity extends AppCompatActivity
                         DatagramPacket reply = new DatagramPacket(
                                 respBytes, respBytes.length,
                                 packet.getAddress(), packet.getPort());
-                        discoverySocket.send(reply);
+                        ds.send(reply);
+                        PipelineLog.d("DISCOVERY", "Answered " + msg + " from "
+                                + PipelineLog.redactIps(packet.getAddress().getHostAddress()));
                     }
                 }
             } catch (Exception e) {
-                Log.d(TAG, "Discovery server ended: " + e.getMessage());
-            } finally {
-                if (discoverySocket != null) {
-                    try { discoverySocket.close(); } catch (Exception ignored) {}
-                    discoverySocket = null;
+                if (activeDiscoveryHostMode != null && discoveryThread == Thread.currentThread()) {
+                    PipelineLog.w("DISCOVERY", "Discovery server ended: " + e);
+                } else {
+                    Log.d(TAG, "Discovery server ended: " + e.getMessage());
                 }
+            } finally {
+                // FIX_PLAN #12: close OUR socket; never null a newer server's socket.
+                if (ds != null) {
+                    try { ds.close(); } catch (Exception ignored) {}
+                }
+                if (discoverySocket == ds) discoverySocket = null;
             }
         }, "UniversalDiscoveryServer");
         discoveryThread.start();
@@ -3604,9 +4886,38 @@ public class MainActivity extends AppCompatActivity
 
     private void stopDiscoveryServer() {
         activeDiscoveryHostMode = null;
-        if (discoverySocket != null) {
-            try { discoverySocket.close(); } catch (Exception ignored) {}
-            discoverySocket = null;
+        discoveryThread = null;
+        DatagramSocket ds = discoverySocket;
+        discoverySocket = null;
+        if (ds != null) {
+            try { ds.close(); } catch (Exception ignored) {}
+        }
+        releaseDiscoveryMulticastLock();
+    }
+
+    private void acquireDiscoveryMulticastLock() {
+        try {
+            if (discoveryMulticastLock == null) {
+                WifiManager wm = (WifiManager) getApplicationContext()
+                        .getSystemService(Context.WIFI_SERVICE);
+                if (wm == null) return;
+                discoveryMulticastLock = wm.createMulticastLock("soundshare:discovery");
+                discoveryMulticastLock.setReferenceCounted(false);
+            }
+            if (!discoveryMulticastLock.isHeld()) discoveryMulticastLock.acquire();
+        } catch (Exception e) {
+            // SecurityException if CHANGE_WIFI_MULTICAST_STATE is missing: discovery still
+            // works on chipsets that don't filter broadcasts.
+            PipelineLog.w("DISCOVERY", "MulticastLock acquire failed: " + e);
+        }
+    }
+
+    private void releaseDiscoveryMulticastLock() {
+        try {
+            WifiManager.MulticastLock l = discoveryMulticastLock;
+            if (l != null && l.isHeld()) l.release();
+        } catch (Exception e) {
+            PipelineLog.w("DISCOVERY", "MulticastLock release failed: " + e);
         }
     }
 
@@ -3620,6 +4931,12 @@ public class MainActivity extends AppCompatActivity
         final DataOutputStream dos;
         final String ip;
         volatile long clockOffset = 0;
+        /**
+         * Set when the peer sends SYNC_INIT_REQ (clock calibration finished). Until then host
+         * broadcasts skip it, so a pulse/queue frame can't land inside the joiner's
+         * SYNC_CLOCK_RSP reads (FIX_PLAN #26). INIT sends the full queue snapshot anyway.
+         */
+        volatile boolean initialized = false;
 
         FileSharePeer(Socket socket, DataInputStream dis, DataOutputStream dos, String ip) {
             this.socket = socket;
@@ -3642,6 +4959,11 @@ public class MainActivity extends AppCompatActivity
 
     @Override
     public void onFileShareHost() {
+        String other = activeOtherMode("File Share");   // FIX_PLAN #23 (M5 helper)
+        if (other != null) {
+            Toast.makeText(this, modeBusyMessage(other), Toast.LENGTH_SHORT).show();
+            return;
+        }
         isFileShareHost = true;
         isFileShareActive.set(true);
         connectedFileSharePeers.clear();
@@ -3649,16 +4971,25 @@ public class MainActivity extends AppCompatActivity
         fileShareFragment.setStatus("Host waiting for receivers on port " + SYNC_CTRL_PORT + "...");
         startUniversalDiscoveryServer("FILE");
         startSyncControlServer();
+        startFileShareService();               // user tap → foreground start allowed (FIX_PLAN #14)
+        BatteryOptHelper.maybeShowHint(this);  // FIX_PLAN #31
     }
 
     @Override
     public void onFileShareJoin(String ip) {
+        String other = activeOtherMode("File Share");   // FIX_PLAN #23 (M5 helper)
+        if (other != null) {
+            Toast.makeText(this, modeBusyMessage(other), Toast.LENGTH_SHORT).show();
+            return;
+        }
         isFileShareHost = false;
         isFileShareActive.set(true);
         connectedPeerIp = ip;
         fileShareFragment.showConnectedUI();
         fileShareFragment.setStatus("Connecting to host " + ip + "...");
         startSyncControlClient(ip);
+        startFileShareService();               // user tap → foreground start allowed (FIX_PLAN #14)
+        BatteryOptHelper.maybeShowHint(this);  // FIX_PLAN #31
     }
 
     @Override
@@ -4022,16 +5353,49 @@ public class MainActivity extends AppCompatActivity
     // ---------- MULTI-FILE PICKER HANDLER ----------
 
     private void handlePickedMultipleFiles(List<android.net.Uri> uris) {
+        // Size probing may copy the file to cache (FIX_PLAN #27): keep that off the UI thread.
+        // Everything below already posts its UI work to mainHandler, and changeAndPlayTrack
+        // is also invoked from network threads elsewhere.
+        final List<android.net.Uri> picked = new ArrayList<>(uris);
+        new Thread(() -> handlePickedMultipleFilesBlocking(picked), "PickedFiles").start();
+    }
+
+    private void handlePickedMultipleFilesBlocking(List<android.net.Uri> uris) {
         for (android.net.Uri uri : uris) {
             String name = "Audio Track";
             long size = 0;
-            android.database.Cursor cursor = getContentResolver().query(uri, null, null, null, null);
-            if (cursor != null && cursor.moveToFirst()) {
-                int nameIdx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
-                int sizeIdx = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE);
-                if (nameIdx >= 0) name = cursor.getString(nameIdx);
-                if (sizeIdx >= 0) size = cursor.getLong(sizeIdx);
-                cursor.close();
+            android.database.Cursor cursor = null;
+            try {
+                cursor = getContentResolver().query(uri, null, null, null, null);
+                if (cursor != null && cursor.moveToFirst()) {
+                    int nameIdx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                    int sizeIdx = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE);
+                    if (nameIdx >= 0 && cursor.getString(nameIdx) != null) name = cursor.getString(nameIdx);
+                    if (sizeIdx >= 0) size = cursor.getLong(sizeIdx);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Picked file query failed: " + e.getMessage());
+            } finally {
+                if (cursor != null) cursor.close();
+            }
+
+            // FIX_PLAN #27: OpenableColumns.SIZE is 0/unknown/stale for many providers, and it is
+            // the length announced on the wire. Use the real length; if the provider can't tell,
+            // copy to cache and send that file instead.
+            String trackIdEarly = String.valueOf(System.currentTimeMillis()) + "_" + (int)(Math.random() * 10000);
+            android.net.Uri sourceUri = uri;
+            String sourcePath = null;
+            long realSize = queryAssetLength(uri);
+            if (realSize > 0) {
+                size = realSize;
+            } else {
+                File copy = copyUriToCache(uri, "fileshare_src_" + NetUtils.sanitizeFileName(trackIdEarly)
+                        + "_" + NetUtils.sanitizeFileName(name));
+                if (copy != null && copy.length() > 0) {
+                    sourceUri = null;
+                    sourcePath = copy.getAbsolutePath();
+                    size = copy.length();
+                }
             }
 
             String mimeType = getContentResolver().getType(uri);
@@ -4059,11 +5423,11 @@ public class MainActivity extends AppCompatActivity
             } catch (Exception ignored) {}
 
             String formatDesc = getAudioFormatDescription(name, mimeType);
-            String trackId = String.valueOf(System.currentTimeMillis()) + "_" + (int)(Math.random() * 10000);
+            String trackId = trackIdEarly;
 
             FileQueueItem queueItem = new FileQueueItem(
                     trackId, name, artist, album, size, mimeType, durMs, durationStr, formatDesc,
-                    uri, null, true);
+                    sourceUri, sourcePath, true);
 
             fileShareQueue.add(queueItem);
 
@@ -4095,6 +5459,50 @@ public class MainActivity extends AppCompatActivity
                 });
             }
         }
+    }
+
+    /** Real byte length of a content Uri, or -1 when the provider can't tell (FIX_PLAN #27). */
+    private long queryAssetLength(android.net.Uri uri) {
+        try (android.content.res.AssetFileDescriptor afd =
+                     getContentResolver().openAssetFileDescriptor(uri, "r")) {
+            if (afd == null) return -1;
+            long len = afd.getLength();
+            if (len == android.content.res.AssetFileDescriptor.UNKNOWN_LENGTH || len <= 0) {
+                // UNKNOWN_LENGTH = "to end of file": a plain file descriptor may still know it.
+                long st = afd.getParcelFileDescriptor() != null
+                        ? afd.getParcelFileDescriptor().getStatSize() - afd.getStartOffset() : -1;
+                return st > 0 ? st : -1;
+            }
+            return len;
+        } catch (Exception e) {
+            Log.w(TAG, "openAssetFileDescriptor failed: " + e.getMessage());
+            return -1;
+        }
+    }
+
+    /** Copies a content Uri into the cache dir; returns null on failure. {@code fileName} must be sanitized. */
+    private File copyUriToCache(android.net.Uri uri, String fileName) {
+        File out = new File(getCacheDir(), fileName);
+        try (InputStream in = getContentResolver().openInputStream(uri);
+             FileOutputStream fos = new FileOutputStream(out)) {
+            if (in == null) throw new IOException("openInputStream returned null");
+            byte[] buf = new byte[64 * 1024];
+            int r;
+            while ((r = in.read(buf)) != -1) fos.write(buf, 0, r);
+            return out;
+        } catch (Exception e) {
+            Log.w(TAG, "Copy to cache failed: " + e.getMessage());
+            //noinspection ResultOfMethodCallIgnored
+            out.delete();
+            return null;
+        }
+    }
+
+    /** Opens the bytes to transfer for a queue item: its content Uri, else its local file; null if neither. */
+    private InputStream openTransferSource(FileQueueItem item) throws IOException {
+        if (item.getLocalUri() != null) return getContentResolver().openInputStream(item.getLocalUri());
+        if (item.getLocalFilePath() != null) return new FileInputStream(item.getLocalFilePath());
+        return null;
     }
 
     private void sendQueueAddOverStream(DataOutputStream out, FileQueueItem item) {
@@ -4147,6 +5555,7 @@ public class MainActivity extends AppCompatActivity
     private void broadcastSyncCommand(byte cmd, long position, long playAt, FileSharePeer excludePeer) {
         for (FileSharePeer peer : connectedFileSharePeers) {
             if (excludePeer != null && peer == excludePeer) continue;
+            if (!peer.initialized) continue;   // still calibrating (FIX_PLAN #26)
             new Thread(() -> {
                 try {
                     synchronized (peer.dos) {
@@ -4166,6 +5575,7 @@ public class MainActivity extends AppCompatActivity
 
     private void broadcastSyncPulse(int index, long pos, long hostTime) {
         for (FileSharePeer peer : connectedFileSharePeers) {
+            if (!peer.initialized) continue;   // still calibrating (FIX_PLAN #26)
             new Thread(() -> {
                 try {
                     synchronized (peer.dos) {
@@ -4185,6 +5595,7 @@ public class MainActivity extends AppCompatActivity
     private void broadcastQueueAdd(FileQueueItem item, FileSharePeer excludePeer) {
         for (FileSharePeer peer : connectedFileSharePeers) {
             if (peer == excludePeer) continue;
+            if (!peer.initialized) continue;   // INIT will send the full queue (FIX_PLAN #26)
             sendQueueAddOverStream(peer.dos, item);
         }
     }
@@ -4192,6 +5603,7 @@ public class MainActivity extends AppCompatActivity
     private void broadcastTrackChange(int index, long playAt, FileSharePeer excludePeer) {
         for (FileSharePeer peer : connectedFileSharePeers) {
             if (peer == excludePeer) continue;
+            if (!peer.initialized) continue;   // INIT sends the current track (FIX_PLAN #26)
             new Thread(() -> {
                 try {
                     synchronized (peer.dos) {
@@ -4210,6 +5622,7 @@ public class MainActivity extends AppCompatActivity
     private void broadcastQueueReorder(int fromPos, int toPos, FileSharePeer excludePeer) {
         for (FileSharePeer peer : connectedFileSharePeers) {
             if (peer == excludePeer) continue;
+            if (!peer.initialized) continue;   // FIX_PLAN #26
             new Thread(() -> {
                 try {
                     synchronized (peer.dos) {
@@ -4228,6 +5641,7 @@ public class MainActivity extends AppCompatActivity
     private void broadcastQueueRemove(String trackId, FileSharePeer excludePeer) {
         for (FileSharePeer peer : connectedFileSharePeers) {
             if (peer == excludePeer) continue;
+            if (!peer.initialized) continue;   // FIX_PLAN #26
             new Thread(() -> {
                 try {
                     synchronized (peer.dos) {
@@ -4258,6 +5672,9 @@ public class MainActivity extends AppCompatActivity
 
     private void transferTrackToAllPeers(FileQueueItem item) {
         for (FileSharePeer peer : connectedFileSharePeers) {
+            // SYNC_FILE_INCOMING on the control stream would break calibration; INIT
+            // transfers every available track anyway (FIX_PLAN #26).
+            if (!peer.initialized) continue;
             transferTrackToSpecificPeer(item, peer);
         }
     }
@@ -4339,15 +5756,8 @@ public class MainActivity extends AppCompatActivity
             dos.writeLong(item.getFileSize());
             dos.flush();
 
-            InputStream fileIn;
-            if (item.getLocalUri() != null) {
-                fileIn = getContentResolver().openInputStream(item.getLocalUri());
-            } else if (item.getLocalFilePath() != null) {
-                fileIn = new FileInputStream(item.getLocalFilePath());
-            } else {
-                return;
-            }
-
+            // try-with-resources: the stream no longer leaks on errors (FIX_PLAN #27)
+            try (InputStream fileIn = openTransferSource(item)) {
             if (fileIn == null) return;
 
             byte[] buffer = new byte[8192];
@@ -4357,7 +5767,10 @@ public class MainActivity extends AppCompatActivity
             long fileSize = item.getFileSize();
 
             int read;
-            while ((read = fileIn.read(buffer)) != -1 && isFileShareActive.get()) {
+            // Never send more than the size announced in the SSFD header.
+            while (sent < fileSize
+                    && (read = fileIn.read(buffer, 0, (int) Math.min(buffer.length, fileSize - sent))) != -1
+                    && isFileShareActive.get()) {
                 dos.write(buffer, 0, read);
                 sent += read;
 
@@ -4380,7 +5793,7 @@ public class MainActivity extends AppCompatActivity
                 }
             }
             dos.flush();
-            fileIn.close();
+            }
 
             mainHandler.post(() -> {
                 if (fileShareFragment != null && fileShareFragment.isAdded()) {
@@ -4449,7 +5862,9 @@ public class MainActivity extends AppCompatActivity
                 dos.writeLong(item.getFileSize());
                 dos.flush();
 
-                InputStream fileIn = getContentResolver().openInputStream(item.getLocalUri());
+                // try-with-resources (FIX_PLAN #27); the source may be a content Uri or a
+                // cache copy made when the provider didn't report a size.
+                try (InputStream fileIn = openTransferSource(item)) {
                 if (fileIn == null) throw new IOException("Cannot open local audio stream");
 
                 byte[] buffer = new byte[8192];
@@ -4459,7 +5874,10 @@ public class MainActivity extends AppCompatActivity
                 long fileSize = item.getFileSize();
 
                 int read;
-                while ((read = fileIn.read(buffer)) != -1 && isFileShareActive.get()) {
+                // Never send more than the size announced in the SSFD header.
+                while (sent < fileSize
+                        && (read = fileIn.read(buffer, 0, (int) Math.min(buffer.length, fileSize - sent))) != -1
+                        && isFileShareActive.get()) {
                     dos.write(buffer, 0, read);
                     sent += read;
 
@@ -4482,7 +5900,7 @@ public class MainActivity extends AppCompatActivity
                     }
                 }
                 dos.flush();
-                fileIn.close();
+                }
 
                 mainHandler.post(() -> {
                     if (fileShareFragment != null && fileShareFragment.isAdded()) {
@@ -4510,9 +5928,12 @@ public class MainActivity extends AppCompatActivity
                 for (int i = 0; i < 5 && !connected && isFileShareActive.get(); i++) {
                     try {
                         receiverSocket = new Socket();
+                        bindToLan(receiverSocket, targetIp);
                         receiverSocket.connect(new InetSocketAddress(targetIp, targetPort), 3000);
                         connected = true;
                     } catch (Exception e) {
+                        closeQuietly(receiverSocket);
+                        receiverSocket = null;
                         Thread.sleep(150);
                     }
                 }
@@ -4520,6 +5941,8 @@ public class MainActivity extends AppCompatActivity
 
                 receiverSocket.setTcpNoDelay(true);
                 receiverSocket.setReceiveBufferSize(65536);
+                // A stalled sender must not hang this thread forever (FIX_PLAN #27).
+                receiverSocket.setSoTimeout(15000);
 
                 DataInputStream dis = new DataInputStream(
                         new BufferedInputStream(receiverSocket.getInputStream()));
@@ -4540,13 +5963,18 @@ public class MainActivity extends AppCompatActivity
                     }
                 });
 
-                File outFile = new File(getCacheDir(), "fileshare_" + trackId + "_" + fileName);
-                FileOutputStream fos = new FileOutputStream(outFile);
+                // trackId and fileName come from the network: sanitize so a "/" or "../"
+                // can't escape the cache dir (FIX_PLAN #27, path traversal).
+                File outFile = new File(getCacheDir(), "fileshare_"
+                        + NetUtils.sanitizeFileName(trackId) + "_"
+                        + NetUtils.sanitizeFileName(fileName));
                 byte[] buffer = new byte[8192];
                 long received = 0;
                 long lastUpdate = System.currentTimeMillis();
                 long lastRecvForSpeed = 0;
+                boolean complete = false;
 
+                try (FileOutputStream fos = new FileOutputStream(outFile)) {
                 while (received < actualSize && isFileShareActive.get()) {
                     int toRead = (int) Math.min(buffer.length, actualSize - received);
                     int rd = dis.read(buffer, 0, toRead);
@@ -4572,7 +6000,28 @@ public class MainActivity extends AppCompatActivity
                         lastRecvForSpeed = received;
                     }
                 }
-                fos.close();
+                complete = received == actualSize;
+                } finally {
+                    if (!complete) {
+                        // Truncated/aborted: never mark a partial file ready (FIX_PLAN #27).
+                        //noinspection ResultOfMethodCallIgnored
+                        outFile.delete();
+                    }
+                }
+                if (!complete) {
+                    final long got = received, want = actualSize;
+                    PipelineLog.w("CONNECT", "File transfer incomplete: " + got + "/" + want + " bytes");
+                    if (isFileShareActive.get()) {
+                        mainHandler.post(() -> {
+                            if (fileShareFragment != null && fileShareFragment.isAdded()) {
+                                fileShareFragment.showTransferProgress(false);
+                                fileShareFragment.setStatus("Transfer of " + fileName
+                                        + " incomplete (" + got + "/" + want + " bytes)");
+                            }
+                        });
+                    }
+                    return;
+                }
 
                 for (FileQueueItem qItem : fileShareQueue) {
                     if (qItem.getId().equals(trackId)) {
@@ -4633,10 +6082,12 @@ public class MainActivity extends AppCompatActivity
 
     private void startSyncControlServer() {
         syncControlThread = new Thread(() -> {
+            ServerSocket ss = null;
             try {
-                syncControlServerSocket = new ServerSocket(SYNC_CTRL_PORT);
+                ss = new ServerSocket(SYNC_CTRL_PORT);
+                syncControlServerSocket = ss;
                 while (isFileShareActive.get()) {
-                    Socket client = syncControlServerSocket.accept();
+                    Socket client = ss.accept();
                     client.setTcpNoDelay(true);
                     String clientIp = client.getInetAddress().getHostAddress();
 
@@ -4655,12 +6106,28 @@ public class MainActivity extends AppCompatActivity
                     new Thread(() -> handleFileSharePeer(peer), "PeerHandler_" + clientIp).start();
                 }
             } catch (Exception e) {
-                if (isFileShareActive.get()) {
+                // Our server (bind failed, or our socket is still the published one) died while the
+                // host is active: nobody can reach this host, so end File Share instead of leaving
+                // its foreground service running (phase5 review L2). A superseded thread does nothing.
+                final boolean ours = ss == null || syncControlServerSocket == ss;
+                if (isFileShareActive.get() && ours) {
                     Log.e(TAG, "SyncControlServer error: " + e.getMessage());
+                    final String why = ss == null
+                            ? "Port " + SYNC_CTRL_PORT + " is in use. File Share host stopped"
+                            : "File Share host stopped (network error)";
+                    mainHandler.post(() -> {
+                        if (!isFileShareActive.get()) return;
+                        stopFileShare();   // posts resetUI(); show the reason after it
+                        mainHandler.post(() -> {
+                            if (fileShareFragment != null && fileShareFragment.isAdded()) {
+                                fileShareFragment.setStatus(why);
+                            }
+                        });
+                    });
                 }
             } finally {
-                closeQuietly(syncControlServerSocket);
-                syncControlServerSocket = null;
+                closeQuietly(ss);   // FIX_PLAN #12: our socket only; keep a newer session's
+                if (syncControlServerSocket == ss) syncControlServerSocket = null;
             }
         }, "SyncControlServer");
         syncControlThread.start();
@@ -4686,6 +6153,9 @@ public class MainActivity extends AppCompatActivity
                     }
                     case SYNC_INIT_REQ: {
                         // Late joiner or new joiner is now fully calibrated and waiting for playlist!
+                        // From now on it receives broadcasts (FIX_PLAN #26). Set before the
+                        // snapshot so nothing added concurrently is missed.
+                        peer.initialized = true;
                         for (FileQueueItem item : new ArrayList<>(fileShareQueue)) {
                             synchronized (peer.dos) {
                                 peer.dos.writeByte(SYNC_QUEUE_ADD);
@@ -4951,7 +6421,9 @@ public class MainActivity extends AppCompatActivity
         new Thread(() -> {
             try {
                 Socket socket = new Socket();
+                bindToLan(socket, hostIp);
                 socket.connect(new InetSocketAddress(hostIp, SYNC_CTRL_PORT), 5000);
+                PipelineLog.i("CONNECT", "Sync control connected to " + PipelineLog.redactIps(hostIp));
                 syncControlSocket = socket;
                 socket.setTcpNoDelay(true);
 
@@ -4971,6 +6443,12 @@ public class MainActivity extends AppCompatActivity
                     }
 
                     byte rsp = dis.readByte();
+                    if (rsp != SYNC_CLOCK_RSP) {
+                        // FIX_PLAN #26: anything else here means the stream is out of sync;
+                        // fail loudly instead of parsing a bogus offset and desyncing.
+                        throw new IOException(String.format(Locale.US,
+                                "Unexpected 0x%02X during clock calibration", rsp & 0xFF));
+                    }
                     long origT1 = dis.readLong();
                     long t2 = dis.readLong();
                     long t3 = dis.readLong();
@@ -5176,53 +6654,49 @@ public class MainActivity extends AppCompatActivity
                             break;
                         }
                         case SYNC_TIME_PULSE: {
-                            int pulseIdx = dis.readInt();
-                            long hostPos = dis.readLong();
-                            long hostTime = dis.readLong();
-                            if (pulseIdx >= 0 && pulseIdx < fileShareQueue.size()) {
-                                FileQueueItem item = fileShareQueue.get(pulseIdx);
-                                long now = System.currentTimeMillis();
-                                long hostTimeInClientClock = hostTime - clockOffset;
-                                long expectedPos = hostPos + (now - hostTimeInClientClock);
+                            final int pulseIdx = dis.readInt();
+                            final long hostPos = dis.readLong();
+                            final long hostTime = dis.readLong();
+                            // All MediaPlayer work happens on the main thread with a local player
+                            // reference, so a concurrent release can't throw here and end the
+                            // whole FileShare session (FIX_PLAN #14 / F-12)
+                            mainHandler.post(() -> {
+                                try {
+                                    if (!isFileShareActive.get()) return;
+                                    if (pulseIdx < 0 || pulseIdx >= fileShareQueue.size()) return;
+                                    FileQueueItem item = fileShareQueue.get(pulseIdx);
+                                    if (item.getLocalFilePath() == null || !item.isReady()) return;
+                                    long now = System.currentTimeMillis();
+                                    long hostTimeInClientClock = hostTime - clockOffset;
+                                    long expectedPos = hostPos + (now - hostTimeInClientClock);
+                                    android.media.MediaPlayer mp = syncMediaPlayer;
 
-                                if (item.getLocalFilePath() != null && item.isReady()) {
-                                    if (syncMediaPlayer == null || currentPlayingQueueIndex != pulseIdx) {
-                                        // Auto-catchup: receiver has file ready but hasn't started playing pulseIdx yet!
+                                    if (mp == null || currentPlayingQueueIndex != pulseIdx) {
+                                        // Auto-catchup (late join): one schedule that starts at the
+                                        // host's position at playAt (no second scheduleLocalPlay)
                                         currentPlayingQueueIndex = pulseIdx;
-                                        playQueueTrack(pulseIdx, now + 50);
-                                        scheduleLocalPlay(expectedPos, now + 50);
-                                    } else if (!syncMediaPlayer.isPlaying() || !isSyncPlaying.get()) {
+                                        playQueueTrack(pulseIdx, now + 50, expectedPos + 50);
+                                    } else if (!mp.isPlaying() || !isSyncPlaying.get()) {
                                         // Receiver player is initialized but paused/stalled: resume it in sync!
                                         scheduleLocalPlay(expectedPos, now);
                                     } else {
-                                        // Player is actively playing: perform seamless drift micro-correction
-                                        try {
-                                            long localPos = syncMediaPlayer.getCurrentPosition();
-                                            long signedDrift = expectedPos - localPos;
-                                            long absDrift = Math.abs(signedDrift);
-
-                                            mainHandler.post(() -> {
-                                                if (syncMediaPlayer != null && isSyncPlaying.get()) {
-                                                    try {
-                                                        if (absDrift > 600) {
-                                                            syncMediaPlayer.seekTo((int) expectedPos);
-                                                            adjustPlaybackSpeed(1.0f);
-                                                        } else if (absDrift > 35) {
-                                                            if (signedDrift > 0) {
-                                                                adjustPlaybackSpeed(1.02f);
-                                                            } else {
-                                                                adjustPlaybackSpeed(0.98f);
-                                                            }
-                                                        } else {
-                                                            adjustPlaybackSpeed(1.0f);
-                                                        }
-                                                    } catch (Exception ignored) {}
-                                                }
-                                            });
-                                        } catch (Exception ignored) {}
+                                        // Player is actively playing: seamless drift micro-correction
+                                        long localPos = mp.getCurrentPosition();
+                                        long signedDrift = expectedPos - localPos;
+                                        long absDrift = Math.abs(signedDrift);
+                                        if (absDrift > 600) {
+                                            mp.seekTo((int) expectedPos);
+                                            adjustPlaybackSpeed(1.0f);
+                                        } else if (absDrift > 35) {
+                                            adjustPlaybackSpeed(signedDrift > 0 ? 1.02f : 0.98f);
+                                        } else {
+                                            adjustPlaybackSpeed(1.0f);
+                                        }
                                     }
+                                } catch (Exception e) {
+                                    Log.w(TAG, "Sync pulse handling failed: " + e.getClass().getSimpleName());
                                 }
-                            }
+                            });
                             break;
                         }
                     }
@@ -5233,7 +6707,11 @@ public class MainActivity extends AppCompatActivity
                     mainHandler.post(() -> {
                         Toast.makeText(this, "Host disconnected", Toast.LENGTH_SHORT).show();
                     });
-                    stopFileShare();
+                    // stopFileShare() touches views and the MediaPlayer: run it on the main thread
+                    // (phase5 review H1: CalledFromWrongThreadException killed the process here).
+                    mainHandler.post(() -> {
+                        if (isFileShareActive.get()) stopFileShare();
+                    });
                 }
             } finally {
                 closeQuietly(syncControlSocket);
@@ -5246,10 +6724,43 @@ public class MainActivity extends AppCompatActivity
     // ---------- PLAYBACK QUEUE PLAYER ----------
 
     private void playQueueTrack(int index, long playAtMs) {
+        playQueueTrack(index, playAtMs, 0);
+    }
+
+    /** Incremented per playQueueTrack; album-art results for an older track are dropped. Main thread only. */
+    private volatile int albumArtRequestId = 0;
+    /** Speed requested while the player was not playing (never applied implicitly — FIX_PLAN #14). */
+    private volatile float pendingPlaybackSpeed = 1.0f;
+    private volatile Runnable pendingSchedulePauseRunnable;
+
+    /** Decodes embedded cover art with inSampleSize so the longest side is ≤ maxSide px. */
+    private static Bitmap decodeBoundedArt(byte[] bytes, int maxSide) {
+        if (bytes == null || bytes.length == 0) return null;
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
+        int sample = 1;
+        while (bounds.outWidth > 0 && bounds.outHeight > 0
+                && (bounds.outWidth / sample > maxSide || bounds.outHeight / sample > maxSide)) {
+            sample *= 2;
+        }
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = sample;
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.length, opts);
+    }
+
+    /**
+     * @param startPosMs position to start from at playAtMs (late join); 0 = from the beginning.
+     */
+    private void playQueueTrack(int index, long playAtMs, long startPosMs) {
         mainHandler.post(() -> {
             if (index < 0 || index >= fileShareQueue.size()) return;
             FileQueueItem item = fileShareQueue.get(index);
             currentPlayingQueueIndex = index;
+            if (pendingSchedulePauseRunnable != null) {
+                mainHandler.removeCallbacks(pendingSchedulePauseRunnable);
+                pendingSchedulePauseRunnable = null;
+            }
 
             try {
                 if (syncMediaPlayer != null) {
@@ -5264,6 +6775,22 @@ public class MainActivity extends AppCompatActivity
                                 .setUsage(AudioAttributes.USAGE_MEDIA)
                                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                                 .build());
+                // Keep the CPU awake while playing with the screen off (FIX_PLAN #14)
+                syncMediaPlayer.setWakeMode(getApplicationContext(),
+                        android.os.PowerManager.PARTIAL_WAKE_LOCK);
+                // Without an error listener MediaPlayer calls onCompletion after an error,
+                // which made the host auto-advance the whole group (F-10)
+                syncMediaPlayer.setOnErrorListener((errMp, what, extra) -> {
+                    PipelineLog.e("MP_ERROR", "MediaPlayer error what=" + what + " extra=" + extra, null);
+                    if (errMp == syncMediaPlayer) {
+                        isSyncPlaying.set(false);
+                        if (fileShareFragment != null && fileShareFragment.isAdded()) {
+                            fileShareFragment.setStatus("Playback error (" + what + "/" + extra + ")");
+                            fileShareFragment.setPlayPauseIcon(false);
+                        }
+                    }
+                    return true;
+                });
 
                 if (item.getLocalUri() != null) {
                     syncMediaPlayer.setDataSource(this, item.getLocalUri());
@@ -5277,24 +6804,49 @@ public class MainActivity extends AppCompatActivity
                 syncMediaPlayer.prepare();
                 applyStereoVolume();
 
-                // Extract embedded album artwork
-                try {
+                // Extract embedded album artwork off the UI thread (FIX_PLAN #14 / F-13);
+                // the result is posted back and ignored if the track changed meanwhile.
+                currentFileAlbumArt = null;
+                final int artRequest = ++albumArtRequestId;
+                final android.net.Uri artUri = item.getLocalUri();
+                final String artPath = item.getLocalFilePath();
+                final android.media.MediaPlayer artPlayer = syncMediaPlayer;
+                final Context appCtx = getApplicationContext();
+                new Thread(() -> {
+                    Bitmap art = null;
                     MediaMetadataRetriever mmr = new MediaMetadataRetriever();
-                    if (item.getLocalUri() != null) {
-                        mmr.setDataSource(this, item.getLocalUri());
-                    } else if (item.getLocalFilePath() != null) {
-                        mmr.setDataSource(item.getLocalFilePath());
+                    try {
+                        if (artUri != null) {
+                            mmr.setDataSource(appCtx, artUri);
+                        } else if (artPath != null) {
+                            mmr.setDataSource(artPath);
+                        }
+                        art = decodeBoundedArt(mmr.getEmbeddedPicture(), 512);
+                    } catch (Exception ignored) {
+                    } finally {
+                        try { mmr.release(); } catch (Exception ignored) {}
                     }
-                    byte[] artBytes = mmr.getEmbeddedPicture();
-                    if (artBytes != null && artBytes.length > 0) {
-                        currentFileAlbumArt = BitmapFactory.decodeByteArray(artBytes, 0, artBytes.length);
-                    } else {
-                        currentFileAlbumArt = null;
-                    }
-                    mmr.release();
-                } catch (Exception ignored) {
-                    currentFileAlbumArt = null;
-                }
+                    if (art == null) return;
+                    final Bitmap finalArt = art;
+                    mainHandler.post(() -> {
+                        if (artRequest != albumArtRequestId || syncMediaPlayer != artPlayer
+                                || currentPlayingQueueIndex != index) {
+                            return;   // stale result for an older track
+                        }
+                        currentFileAlbumArt = finalArt;
+                        if (fileShareFragment != null && fileShareFragment.isAdded()
+                                && fileShareFragment.getView() != null) {
+                            android.widget.ImageView iv = fileShareFragment.getView()
+                                    .findViewById(R.id.ivPlaybackAlbumArt);
+                            if (iv != null) {
+                                iv.setImageBitmap(finalArt);
+                                iv.setScaleType(android.widget.ImageView.ScaleType.CENTER_CROP);
+                                iv.setPadding(0, 0, 0, 0);
+                            }
+                        }
+                        try { updateFileNotification(isSyncPlaying.get()); } catch (Exception ignored) {}
+                    });
+                }, "AlbumArtDecode").start();
 
                 int duration = syncMediaPlayer.getDuration();
                 fileShareFragment.showPlaybackControls(true);
@@ -5336,7 +6888,7 @@ public class MainActivity extends AppCompatActivity
                 });
 
                 startPlaybackUpdateLoop();
-                scheduleLocalPlay(0, playAtMs);
+                scheduleLocalPlay(Math.max(0, startPosMs), playAtMs);
 
             } catch (Exception e) {
                 Log.e(TAG, "playQueueTrack error: " + e.getMessage(), e);
@@ -5364,6 +6916,15 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void stopPlayback() {
+        if (pendingSchedulePlayRunnable != null) {
+            mainHandler.removeCallbacks(pendingSchedulePlayRunnable);
+            pendingSchedulePlayRunnable = null;
+        }
+        if (pendingSchedulePauseRunnable != null) {
+            mainHandler.removeCallbacks(pendingSchedulePauseRunnable);
+            pendingSchedulePauseRunnable = null;
+        }
+        albumArtRequestId++;   // drop any album-art decode still in flight
         if (syncMediaPlayer != null) {
             try { syncMediaPlayer.stop(); } catch (Exception ignored) {}
             try { syncMediaPlayer.release(); } catch (Exception ignored) {}
@@ -5413,22 +6974,30 @@ public class MainActivity extends AppCompatActivity
 
     // ---------- SYNCHRONIZED PLAYBACK TIMING ----------
 
+    /**
+     * Changes the playback speed only while the player is actually playing. On a prepared/paused
+     * player setPlaybackParams(speed≠0) is documented to START playback, which made peers start
+     * early (F-11); in that case the speed is only remembered.
+     */
     private void adjustPlaybackSpeed(float targetSpeed) {
-        if (syncMediaPlayer == null) return;
+        android.media.MediaPlayer mp = syncMediaPlayer;
+        if (mp == null) return;
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                PlaybackParams current = null;
-                try {
-                    current = syncMediaPlayer.getPlaybackParams();
-                } catch (Exception ignored) {}
-                if (current == null) {
-                    current = new PlaybackParams();
-                }
-                float currentSpeed = current.getSpeed();
-                if (Math.abs(currentSpeed - targetSpeed) > 0.005f) {
-                    current.setSpeed(targetSpeed);
-                    syncMediaPlayer.setPlaybackParams(current);
-                }
+            if (!mp.isPlaying()) {
+                pendingPlaybackSpeed = targetSpeed;
+                return;
+            }
+            PlaybackParams current = null;
+            try {
+                current = mp.getPlaybackParams();
+            } catch (Exception ignored) {}
+            if (current == null) {
+                current = new PlaybackParams().setSpeed(1.0f);
+            }
+            float currentSpeed = current.getSpeed();
+            if (Math.abs(currentSpeed - targetSpeed) > 0.005f) {
+                current.setSpeed(targetSpeed);
+                mp.setPlaybackParams(current);
             }
         } catch (Exception ignored) {}
     }
@@ -5439,30 +7008,39 @@ public class MainActivity extends AppCompatActivity
                 mainHandler.removeCallbacks(pendingSchedulePlayRunnable);
                 pendingSchedulePlayRunnable = null;
             }
-            if (syncMediaPlayer == null) return;
+            if (pendingSchedulePauseRunnable != null) {
+                mainHandler.removeCallbacks(pendingSchedulePauseRunnable);
+                pendingSchedulePauseRunnable = null;
+            }
+            final android.media.MediaPlayer mp = syncMediaPlayer;
+            if (mp == null) return;
             try {
-                adjustPlaybackSpeed(1.0f);
+                // No speed change before start(): on a paused player it would start playback now
                 long now = System.currentTimeMillis();
                 if (now >= playAtMs) {
                     // Start time was in the past (e.g. preparation lag): seek once and start immediately
                     long timePassed = now - playAtMs;
                     long compensatedPos = positionMs + timePassed;
-                    int dur = syncMediaPlayer.getDuration();
+                    int dur = mp.getDuration();
                     if (dur > 0 && compensatedPos >= dur) compensatedPos = dur;
-                    syncMediaPlayer.seekTo((int) compensatedPos);
-                    syncMediaPlayer.start();
+                    mp.seekTo((int) compensatedPos);
+                    mp.start();
+                    pendingPlaybackSpeed = 1.0f;
+                    adjustPlaybackSpeed(1.0f);   // reset any speed remembered from before the pause
                     isSyncPlaying.set(true);
                     if (fileShareFragment != null && fileShareFragment.isAdded()) {
                         fileShareFragment.setPlayPauseIcon(true);
                     }
                     updateFileNotification(true);
                 } else {
-                    syncMediaPlayer.seekTo((int) positionMs);
+                    mp.seekTo((int) positionMs);
                     long delay = playAtMs - now;
                     pendingSchedulePlayRunnable = () -> {
-                        if (syncMediaPlayer != null && isFileShareActive.get()) {
+                        if (syncMediaPlayer == mp && isFileShareActive.get()) {
                             try {
-                                syncMediaPlayer.start();
+                                mp.start();
+                                pendingPlaybackSpeed = 1.0f;
+                                adjustPlaybackSpeed(1.0f);
                                 isSyncPlaying.set(true);
                                 if (fileShareFragment != null && fileShareFragment.isAdded()) {
                                     fileShareFragment.setPlayPauseIcon(true);
@@ -5481,12 +7059,20 @@ public class MainActivity extends AppCompatActivity
 
     private void pauseLocalAt(long positionMs, long pauseAtMs) {
         mainHandler.post(() -> {
-            if (syncMediaPlayer == null) return;
-            adjustPlaybackSpeed(1.0f);
+            final android.media.MediaPlayer mp = syncMediaPlayer;
+            if (mp == null) return;
+            if (pendingSchedulePauseRunnable != null) {
+                mainHandler.removeCallbacks(pendingSchedulePauseRunnable);
+                pendingSchedulePauseRunnable = null;
+            }
             long now = System.currentTimeMillis();
             if (now >= pauseAtMs) {
                 try {
-                    syncMediaPlayer.pause();
+                    // Speed back to 1.0 in the same main-thread step as pause(), while still
+                    // playing, so no drift correction can slip in between (F-11)
+                    adjustPlaybackSpeed(1.0f);
+                    mp.pause();
+                    pendingPlaybackSpeed = 1.0f;
                     isSyncPlaying.set(false);
                     if (fileShareFragment != null && fileShareFragment.isAdded()) {
                         fileShareFragment.setPlayPauseIcon(false);
@@ -5495,10 +7081,13 @@ public class MainActivity extends AppCompatActivity
                 } catch (Exception ignored) {}
             } else {
                 long delay = pauseAtMs - now;
-                mainHandler.postDelayed(() -> {
-                    if (syncMediaPlayer != null) {
+                pendingSchedulePauseRunnable = () -> {
+                    pendingSchedulePauseRunnable = null;
+                    if (syncMediaPlayer == mp) {
                         try {
-                            syncMediaPlayer.pause();
+                            adjustPlaybackSpeed(1.0f);
+                            mp.pause();
+                            pendingPlaybackSpeed = 1.0f;
                             isSyncPlaying.set(false);
                             if (fileShareFragment != null && fileShareFragment.isAdded()) {
                                 fileShareFragment.setPlayPauseIcon(false);
@@ -5506,7 +7095,8 @@ public class MainActivity extends AppCompatActivity
                             updateFileNotification(false);
                         } catch (Exception ignored) {}
                     }
-                }, delay);
+                };
+                mainHandler.postDelayed(pendingSchedulePauseRunnable, delay);
             }
         });
     }
@@ -5551,6 +7141,7 @@ public class MainActivity extends AppCompatActivity
         if (fileShareNotifHelper != null) {
             fileShareNotifHelper.clearNotification();
         }
+        stopFileShareService();   // FIX_PLAN #14 (no-op unless the service runs in fileshare mode)
 
         for (FileSharePeer peer : connectedFileSharePeers) {
             peer.close();

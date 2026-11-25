@@ -41,6 +41,8 @@ public class FileShareNotificationHelper {
     private boolean isPlaying = false;
     private long currentDurationMs = 0;
     private long currentPositionMs = 0;
+    /** Id of the last posted notification: NOTIFICATION_ID, or the FGS id in fileshare mode. */
+    private int postedId = 0;
 
     public FileShareNotificationHelper(Context context) {
         this.context = context.getApplicationContext();
@@ -77,26 +79,31 @@ public class FileShareNotificationHelper {
             mediaSession.setCallback(new MediaSessionCompat.Callback() {
                 @Override
                 public void onPlay() {
+                    if (MediaMetadataHelper.isEcho()) return; // self-dispatched key (FIX_PLAN #9)
                     sendExplicitBroadcast(BROADCAST_FILE_PLAY_PAUSE);
                 }
 
                 @Override
                 public void onPause() {
+                    if (MediaMetadataHelper.isEcho()) return; // self-dispatched key (FIX_PLAN #9)
                     sendExplicitBroadcast(BROADCAST_FILE_PLAY_PAUSE);
                 }
 
                 @Override
                 public void onSkipToNext() {
+                    if (MediaMetadataHelper.isEcho()) return; // self-dispatched key (FIX_PLAN #9)
                     sendExplicitBroadcast(BROADCAST_FILE_NEXT);
                 }
 
                 @Override
                 public void onSkipToPrevious() {
+                    if (MediaMetadataHelper.isEcho()) return; // self-dispatched key (FIX_PLAN #9)
                     sendExplicitBroadcast(BROADCAST_FILE_PREV);
                 }
 
                 @Override
                 public void onStop() {
+                    if (MediaMetadataHelper.isEcho()) return; // self-dispatched key (FIX_PLAN #9)
                     sendExplicitBroadcast(BROADCAST_FILE_STOP);
                 }
 
@@ -137,7 +144,19 @@ public class FileShareNotificationHelper {
         updateMediaSessionMetadata();
 
         if (notificationManager != null) {
-            notificationManager.notify(NOTIFICATION_ID, buildNotification());
+            // While AudioReceiveService runs in "fileshare" mode, post on its foreground
+            // notification id: the FGS notification becomes this media notification and the
+            // user sees one notification instead of two (FIX_PLAN #14).
+            int id = AudioReceiveService.isForegroundInMode(AudioReceiveService.MODE_FILESHARE)
+                    ? AudioReceiveService.FGS_NOTIFICATION_ID
+                    : NOTIFICATION_ID;
+            try {
+                if (postedId != 0 && postedId != id && postedId == NOTIFICATION_ID) {
+                    notificationManager.cancel(NOTIFICATION_ID);
+                }
+                notificationManager.notify(id, buildNotification());
+                postedId = id;
+            } catch (Exception ignored) {}
         }
     }
 
@@ -237,7 +256,10 @@ public class FileShareNotificationHelper {
     public void clearNotification() {
         if (notificationManager != null) {
             notificationManager.cancel(NOTIFICATION_ID);
+            // The FGS-id copy is removed by AudioReceiveService.onDestroy (cancel() cannot
+            // remove a live foreground-service notification).
         }
+        postedId = 0;
         if (mediaSession != null) {
             try {
                 mediaSession.setActive(false);

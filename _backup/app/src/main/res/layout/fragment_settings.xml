@@ -1,0 +1,810 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Settings Fragment: SharedPreferences-backed configuration -->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/scrollSettings"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg_dark"
+    android:fillViewport="true"
+    android:scrollbars="none"
+    android:overScrollMode="never">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingHorizontal="20dp"
+        android:paddingTop="28dp"
+        android:paddingBottom="32dp">
+
+        <!-- ====== HEADER ====== -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Settings"
+            android:textSize="26sp"
+            android:textStyle="bold"
+            android:textColor="@color/text_primary"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="-0.01"
+            android:paddingBottom="4dp" />
+
+        <TextView
+            android:id="@+id/tvDeviceModel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Configure audio and connection parameters"
+            android:textSize="14sp"
+            android:textColor="@color/text_secondary"
+            android:fontFamily="sans-serif-light"
+            android:paddingBottom="24dp" />
+
+        <!-- ======================================================== -->
+        <!-- ====== CATEGORY 1: AUDIO & DSP PROCESSING ====== -->
+        <!-- ======================================================== -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="AUDIO &amp; SIGNAL ENGINE"
+            android:textSize="12sp"
+            android:textStyle="bold"
+            android:textColor="@color/accent_primary_light"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.08"
+            android:paddingBottom="10dp" />
+
+        <!-- Buffer Size -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="12dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Buffer Size"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:id="@+id/tvBufferValue"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Auto"
+                    android:textSize="14sp"
+                    android:textColor="@color/accent_secondary"
+                    android:fontFamily="sans-serif-medium" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Lower values decrease latency; higher values prevent underruns"
+                android:textSize="11.5sp"
+                android:textColor="@color/text_hint"
+                android:fontFamily="sans-serif-light" />
+
+            <SeekBar
+                android:id="@+id/seekBufferSize"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:progressTint="@color/accent_primary"
+                android:thumbTint="@color/accent_primary" />
+        </LinearLayout>
+
+        <!-- Performance Mode -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="12dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Performance Mode"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:id="@+id/tvPerfMode"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Low Latency"
+                    android:textSize="14sp"
+                    android:textColor="@color/accent_secondary"
+                    android:fontFamily="sans-serif-medium" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Controls Android AudioTrack / AudioRecord HAL thread priority"
+                android:textSize="11.5sp"
+                android:textColor="@color/text_hint"
+                android:fontFamily="sans-serif-light" />
+
+            <SeekBar
+                android:id="@+id/seekPerfMode"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:progressTint="@color/accent_primary"
+                android:thumbTint="@color/accent_primary" />
+        </LinearLayout>
+
+        <!-- Audio Gain Boost -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="12dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Output Gain Boost"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:id="@+id/tvAudioGain"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="0 dB (Flat)"
+                    android:textSize="14sp"
+                    android:textColor="@color/accent_secondary"
+                    android:fontFamily="sans-serif-medium" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Digital pre-amp amplification for quiet streams"
+                android:textSize="11.5sp"
+                android:textColor="@color/text_hint"
+                android:fontFamily="sans-serif-light" />
+
+            <SeekBar
+                android:id="@+id/seekAudioGain"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:max="3"
+                android:progressTint="@color/accent_primary"
+                android:thumbTint="@color/accent_primary" />
+        </LinearLayout>
+
+        <!-- Channel Mode Routing -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="12dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Channel Mode"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:id="@+id/tvChannelMode"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Stereo (L/R)"
+                    android:textSize="14sp"
+                    android:textColor="@color/accent_secondary"
+                    android:fontFamily="sans-serif-medium" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Stereo standard, mono downmix, or inverted channels"
+                android:textSize="11.5sp"
+                android:textColor="@color/text_hint"
+                android:fontFamily="sans-serif-light" />
+
+            <SeekBar
+                android:id="@+id/seekChannelMode"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:max="2"
+                android:progressTint="@color/accent_primary"
+                android:thumbTint="@color/accent_primary" />
+        </LinearLayout>
+
+        <!-- Auto-Pause on Headset Disconnect -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="24dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Auto-Pause on Disconnect"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Pause stream when wired or Bluetooth headphones disconnect"
+                    android:textSize="11.5sp"
+                    android:textColor="@color/text_hint"
+                    android:fontFamily="sans-serif-light"
+                    android:paddingTop="2dp" />
+            </LinearLayout>
+
+            <androidx.appcompat.widget.SwitchCompat
+                android:id="@+id/switchAutoPauseHeadset"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="true" />
+        </LinearLayout>
+
+        <!-- ======================================================== -->
+        <!-- ====== CATEGORY 2: NETWORK & PROTOCOL ENGINE ====== -->
+        <!-- ======================================================== -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="NETWORK &amp; TRANSMISSION"
+            android:textSize="12sp"
+            android:textStyle="bold"
+            android:textColor="@color/accent_primary_light"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.08"
+            android:paddingBottom="10dp" />
+
+        <!-- TCP_NODELAY Toggle -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="12dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="TCP_NODELAY (Bypass Nagle)"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Sends packets instantly without OS buffering for minimal latency"
+                    android:textSize="11.5sp"
+                    android:textColor="@color/text_hint"
+                    android:fontFamily="sans-serif-light"
+                    android:paddingTop="2dp" />
+            </LinearLayout>
+
+            <androidx.appcompat.widget.SwitchCompat
+                android:id="@+id/switchTcpNoDelay"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="true" />
+        </LinearLayout>
+
+        <!-- Socket Buffer Multiplier -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="12dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Socket Buffer Multiplier"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:id="@+id/tvSocketBuffer"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="4×"
+                    android:textSize="14sp"
+                    android:textColor="@color/accent_secondary"
+                    android:fontFamily="sans-serif-medium" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Socket receive window multiplier for high-bandwidth Wi-Fi"
+                android:textSize="11.5sp"
+                android:textColor="@color/text_hint"
+                android:fontFamily="sans-serif-light" />
+
+            <SeekBar
+                android:id="@+id/seekSocketBuffer"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:max="16"
+                android:progressTint="@color/accent_primary"
+                android:thumbTint="@color/accent_primary" />
+        </LinearLayout>
+
+        <!-- Connection Timeout -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="12dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingBottom="4dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Connection Timeout"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:id="@+id/tvConnTimeout"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="3000 ms"
+                    android:textSize="14sp"
+                    android:textColor="@color/accent_secondary"
+                    android:fontFamily="sans-serif-medium" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Maximum handshake wait time before reporting timeout"
+                android:textSize="11.5sp"
+                android:textColor="@color/text_hint"
+                android:fontFamily="sans-serif-light" />
+
+            <SeekBar
+                android:id="@+id/seekConnTimeout"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:max="10"
+                android:progressTint="@color/accent_primary"
+                android:thumbTint="@color/accent_primary" />
+        </LinearLayout>
+
+        <!-- Custom Streaming Port -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="12dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Custom Streaming Port"
+                android:textSize="15sp"
+                android:textStyle="bold"
+                android:textColor="@color/text_primary"
+                android:fontFamily="sans-serif-medium"
+                android:paddingBottom="2dp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Default: 9876. Change for custom LAN or port-forwarding rules"
+                android:textSize="11.5sp"
+                android:textColor="@color/text_hint"
+                android:fontFamily="sans-serif-light"
+                android:paddingBottom="10dp" />
+
+            <EditText
+                android:id="@+id/etCustomPort"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:hint="9876"
+                android:textColorHint="@color/text_hint"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp"
+                android:inputType="number"
+                android:imeOptions="actionDone"
+                android:background="@drawable/bg_input_field"
+                android:paddingHorizontal="16dp"
+                android:fontFamily="sans-serif-light"
+                android:maxLines="1"
+                android:autofillHints="" />
+        </LinearLayout>
+
+        <!-- Auto-Reconnect on Drop -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="24dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Auto-Reconnect on Drop"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Automatically attempt to resume session on Wi-Fi glitches"
+                    android:textSize="11.5sp"
+                    android:textColor="@color/text_hint"
+                    android:fontFamily="sans-serif-light"
+                    android:paddingTop="2dp" />
+            </LinearLayout>
+
+            <androidx.appcompat.widget.SwitchCompat
+                android:id="@+id/switchAutoReconnect"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="true" />
+        </LinearLayout>
+
+        <!-- ======================================================== -->
+        <!-- ====== CATEGORY 3: SYSTEM, POWER & BEHAVIOR ====== -->
+        <!-- ======================================================== -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="SYSTEM &amp; POWER MANAGEMENT"
+            android:textSize="12sp"
+            android:textStyle="bold"
+            android:textColor="@color/accent_primary_light"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.08"
+            android:paddingBottom="10dp" />
+
+        <!-- Client Name -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="12dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Client Display Name"
+                android:textSize="15sp"
+                android:textStyle="bold"
+                android:textColor="@color/text_primary"
+                android:fontFamily="sans-serif-medium"
+                android:paddingBottom="2dp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Displayed to other devices in discovery and chat"
+                android:textSize="11.5sp"
+                android:textColor="@color/text_hint"
+                android:fontFamily="sans-serif-light"
+                android:paddingBottom="10dp" />
+
+            <EditText
+                android:id="@+id/etClientName"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:hint="Device name"
+                android:textColorHint="@color/text_hint"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp"
+                android:inputType="text"
+                android:imeOptions="actionDone"
+                android:background="@drawable/bg_input_field"
+                android:paddingHorizontal="16dp"
+                android:fontFamily="sans-serif-light"
+                android:maxLines="1"
+                android:autofillHints="" />
+        </LinearLayout>
+
+        <!-- Keep Screen Awake -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="12dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Keep Screen Awake"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Prevent screen from locking or sleeping while actively streaming"
+                    android:textSize="11.5sp"
+                    android:textColor="@color/text_hint"
+                    android:fontFamily="sans-serif-light"
+                    android:paddingTop="2dp" />
+            </LinearLayout>
+
+            <androidx.appcompat.widget.SwitchCompat
+                android:id="@+id/switchKeepScreenOn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="false" />
+        </LinearLayout>
+
+        <!-- CPU WakeLock -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="12dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="High Priority CPU WakeLock"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Prevents aggressive OEM battery management from cutting background stream"
+                    android:textSize="11.5sp"
+                    android:textColor="@color/text_hint"
+                    android:fontFamily="sans-serif-light"
+                    android:paddingTop="2dp" />
+            </LinearLayout>
+
+            <androidx.appcompat.widget.SwitchCompat
+                android:id="@+id/switchCpuWakeLock"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="true" />
+        </LinearLayout>
+
+        <!-- Haptic Vibration Feedback -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="24dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Haptic Vibration Feedback"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:fontFamily="sans-serif-medium" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Subtle tactile feedback when tapping transport buttons"
+                    android:textSize="11.5sp"
+                    android:textColor="@color/text_hint"
+                    android:fontFamily="sans-serif-light"
+                    android:paddingTop="2dp" />
+            </LinearLayout>
+
+            <androidx.appcompat.widget.SwitchCompat
+                android:id="@+id/switchHapticFeedback"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="true" />
+        </LinearLayout>
+
+        <!-- ======================================================== -->
+        <!-- ====== CATEGORY 4: HARDWARE & DIAGNOSTICS ====== -->
+        <!-- ======================================================== -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="HARDWARE &amp; DIAGNOSTICS"
+            android:textSize="12sp"
+            android:textStyle="bold"
+            android:textColor="@color/accent_primary_light"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.08"
+            android:paddingBottom="10dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_settings_card"
+            android:padding="18dp"
+            android:layout_marginBottom="20dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Audio Pipeline Capabilities"
+                android:textSize="15sp"
+                android:textStyle="bold"
+                android:textColor="@color/text_primary"
+                android:fontFamily="sans-serif-medium"
+                android:paddingBottom="10dp" />
+
+            <TextView
+                android:id="@+id/tvAudioCaps"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="16-bit PCM"
+                android:textSize="13sp"
+                android:textColor="@color/text_secondary"
+                android:fontFamily="sans-serif-light"
+                android:lineSpacingExtra="4dp" />
+        </LinearLayout>
+
+        <!-- ====== RESET BUTTON ====== -->
+        <Button
+            android:id="@+id/btnResetDefaults"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:text="Reset to Defaults"
+            android:textSize="15sp"
+            android:textColor="#FFFFFF"
+            android:textAllCaps="false"
+            android:fontFamily="sans-serif-medium"
+            android:background="@drawable/bg_button_red"
+            android:drawableStart="@drawable/ic_reset"
+            android:drawablePadding="10dp"
+            android:drawableTint="#FFFFFF"
+            android:paddingHorizontal="18dp"
+            android:layout_marginTop="8dp"
+            android:stateListAnimator="@null"
+            android:elevation="0dp" />
+    </LinearLayout>
+</ScrollView>

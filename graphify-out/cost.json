@@ -5,6 +5,13 @@
       "input_tokens": 0,
       "output_tokens": 0,
       "files": 55
+    },
+    {
+      "date": "2026-11-23T06:13:27.404658+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 134,
+      "note": "code-only AST rebuild"
     }
   ],
   "total_input_tokens": 0,

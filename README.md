@@ -77,15 +77,20 @@ flowchart LR
 
 ## Network Protocol
 
-SoundShare utilizes a custom binary protocol (v2) featuring a 28-byte header and the magic string `SSHD`. Communication is distributed across five dedicated TCP ports:
+SoundShare uses a custom binary protocol (v2) with a 28-byte header and the magic string `SSHD`. Traffic is spread over eight ports:
 
-| Port | Purpose |
-|:---:|---|
-| `5000` | Main audio data stream |
-| `5001` | Ping / latency measurement and transport control (pause / resume / skip) |
-| `5002` | Chat and metadata broadcast |
-| `5003` | Duplex audio stream |
-| `5004` | Duplex chat stream |
+| Port | Proto | Purpose |
+|:---:|:---:|---|
+| `5000` | TCP | Main audio data stream |
+| `5001` | TCP | Ping / latency measurement and transport control (pause / resume / skip) |
+| `5002` | TCP | Chat and metadata broadcast |
+| `5003` | TCP | Duplex audio stream |
+| `5004` | TCP | Duplex chat stream |
+| `5005` | TCP | File Share data transfer |
+| `5006` | TCP | File Share sync-control (synchronized playback) |
+| `5007` | UDP | File Share host discovery |
+
+The Linux client in `c/` speaks the same protocol, so the header layout, command bytes and ports must stay byte-identical.
 
 ---
 
@@ -124,7 +129,35 @@ Seven one-tap presets are available, ranging from battery-saver modes to high-re
 ./gradlew connectedAndroidTest   # Instrumented tests
 ```
 
-*Note: Host and receiver devices must be connected to the same local Wi-Fi network.*
+*Note: Host and receiver devices must be connected to the same local Wi-Fi network (or one phone's hotspot).*
+
+### Start / Stop
+
+| Action | How |
+|---|---|
+| Start streaming (host) | Open **Stream** → pick a quality preset → **Start Streaming** → accept the screen-capture prompt. The host IP is shown on screen. |
+| Start receiving | Open **Receive** → enter the host IP (or tap **Scan**) → **Start Receiving**. |
+| Duplex | Open **Duplex** → one device taps **Host**, the other taps **Join** with the host IP. |
+| Stop | Tap the same button again (it becomes a stop button while a session runs), tap **Stop Session** in Duplex, or use the stop action in the media notification. The foreground service shuts down when its session ends. |
+| Stop the app's dev build | `adb shell am force-stop com.example.soundshare` |
+| Uninstall | `./gradlew uninstallDebug` |
+
+### Quick reference
+
+| Service | Address |
+|---|---|
+| Audio / ping / chat | `<host-ip>:5000` / `:5001` / `:5002` (TCP) |
+| Duplex audio / chat | `<host-ip>:5003` / `:5004` (TCP) |
+| File Share data / sync | `<host-ip>:5005` / `:5006` (TCP) |
+| File Share discovery | broadcast `:5007` (UDP) |
+
+### Troubleshooting / device compatibility
+
+If streaming works on some phones but not others, see [REPORT.md](REPORT.md) for the root causes and fixes and [DEVICE_MATRIX.md](DEVICE_MATRIX.md) for per-OEM and per-Android-version test steps. Common fixes:
+
+- Exempt SoundShare from battery optimization (the app shows a one-time hint with maker-specific steps for Xiaomi, Oppo, Realme, OnePlus, Vivo, Huawei, Honor and Samsung).
+- Keep both devices on the same Wi-Fi band and subnet. Turn off VPNs and "Wi-Fi + mobile data" switching.
+- If a Hi-Res preset fails, the host now falls back to a supported format automatically. Check the status line to see what was actually used.
 
 ---
 
@@ -145,15 +178,17 @@ SoundShare/
 
 ## Knowledge Graph
 
-This repository includes a graphify-generated knowledge graph for architecture reference, located in the `graphify-out/` directory:
+This project has a graphify Obsidian vault for architecture reference:
 
-- `graph.json` — Machine-readable graph data
-- `GRAPH_REPORT.md` — Human-readable architecture report
+- **Vault:** `~/vaults/soundshare_v1/`
+- **Graph:** `/home/abinav/AndroidStudioProjects/soundshare_v1/graphify-out/graph.json`
+- **Report:** `/home/abinav/AndroidStudioProjects/soundshare_v1/graphify-out/GRAPH_REPORT.md`
+- **Communities:** MainActivity Core, AudioConfig Presets, StreamFragment UI, ReceiveFragment UI, DuplexFragment UI, FileShareFragment UI, SettingsFragment, AudioCaptureService, AudioReceiveService, MediaMetadataHelper, FLAC Codec, HiResAudioHelper, AudioPipelineUtils, NetUtils, PipelineLog, BatteryOptHelper, LyricsHelper, Chat, FileShare queue/notifications, C client (GUI, sync server/client, network, audio player, transfer, stream receiver), Build Config, Tests (49 communities, rebuilt 2026-11-23)
 
-To rebuild the vault after making code changes:
+To rebuild the vault after code changes:
 
 ```bash
-graphify . --obsidian --obsidian-dir ~/vaults/soundshare
+graphify /home/abinav/AndroidStudioProjects/soundshare_v1 --obsidian --obsidian-dir ~/vaults/soundshare_v1
 ```
 
 ---

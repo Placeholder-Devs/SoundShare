@@ -3,7 +3,9 @@ package com.example.soundshare;
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
 import android.animation.ObjectAnimator;
+import android.animation.PropertyValuesHolder;
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -13,6 +15,7 @@ import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageButton;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -53,10 +56,11 @@ public class ReceiveFragment extends Fragment {
     private ImageButton btnChatSend;
 
     // Now Playing
+    private ImageView ivReceiveAlbumArt;
     private TextView tvNowPlayingTitle, tvNowPlayingSubtitle;
     private TextView tvNowPlayingElapsed, tvNowPlayingStatus;
     private View nowPlayingDot;
-    private ImageButton btnPlayPause, btnSkipPrev, btnSkipNext;
+    private ImageButton btnPlayPause, btnPlayPauseMini, btnSkipPrev, btnSkipNext;
 
     private ChatAdapter chatAdapter;
     private boolean isActive = false;
@@ -110,12 +114,14 @@ public class ReceiveFragment extends Fragment {
         btnChatSend = v.findViewById(R.id.btnChatSend);
 
         nowPlayingCard = v.findViewById(R.id.nowPlayingCard);
+        ivReceiveAlbumArt = v.findViewById(R.id.ivReceiveAlbumArt);
         tvNowPlayingTitle = v.findViewById(R.id.tvNowPlayingTitle);
         tvNowPlayingSubtitle = v.findViewById(R.id.tvNowPlayingSubtitle);
         tvNowPlayingElapsed = v.findViewById(R.id.tvNowPlayingElapsed);
         tvNowPlayingStatus = v.findViewById(R.id.tvNowPlayingStatus);
         nowPlayingDot = v.findViewById(R.id.nowPlayingDot);
         btnPlayPause = v.findViewById(R.id.btnPlayPause);
+        btnPlayPauseMini = v.findViewById(R.id.btnPlayPauseMini);
         btnSkipPrev = v.findViewById(R.id.btnSkipPrev);
         btnSkipNext = v.findViewById(R.id.btnSkipNext);
 
@@ -138,6 +144,13 @@ public class ReceiveFragment extends Fragment {
         if (btnPlayPause != null) {
             btnPlayPause.setOnClickListener(btn -> {
                 animateButtonPress(btnPlayPause);
+                if (callback != null) callback.onReceiveTogglePlayPause();
+            });
+        }
+
+        if (btnPlayPauseMini != null) {
+            btnPlayPauseMini.setOnClickListener(btn -> {
+                animateButtonPress(btnPlayPauseMini);
                 if (callback != null) callback.onReceiveTogglePlayPause();
             });
         }
@@ -191,6 +204,9 @@ public class ReceiveFragment extends Fragment {
 
     /** Scale button down then back up — tactile press feel */
     private void animateButtonPress(View view) {
+        if (getContext() != null && SettingsFragment.isHapticFeedback(getContext())) {
+            view.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY);
+        }
         view.animate()
             .scaleX(0.92f).scaleY(0.92f)
             .setDuration(80)
@@ -231,16 +247,15 @@ public class ReceiveFragment extends Fragment {
     /** Continuous pulse on the status dot */
     private void startPulse(View dot, float minScale, float maxScale) {
         if (pulseAnimator != null) pulseAnimator.cancel();
-        pulseAnimator = ObjectAnimator.ofFloat(dot, "scaleX", minScale, maxScale, minScale);
+        // One animator for X and Y so stopPulse() cancels both (the separate, untracked
+        // scaleY animator used to keep running forever, one more per start).
+        pulseAnimator = ObjectAnimator.ofPropertyValuesHolder(dot,
+                PropertyValuesHolder.ofFloat(View.SCALE_X, minScale, maxScale, minScale),
+                PropertyValuesHolder.ofFloat(View.SCALE_Y, minScale, maxScale, minScale));
         pulseAnimator.setDuration(1200);
         pulseAnimator.setRepeatCount(ObjectAnimator.INFINITE);
         pulseAnimator.setInterpolator(new AccelerateDecelerateInterpolator());
-        ObjectAnimator pulseY = ObjectAnimator.ofFloat(dot, "scaleY", minScale, maxScale, minScale);
-        pulseY.setDuration(1200);
-        pulseY.setRepeatCount(ObjectAnimator.INFINITE);
-        pulseY.setInterpolator(new AccelerateDecelerateInterpolator());
         pulseAnimator.start();
-        pulseY.start();
     }
 
     private void stopPulse() {
@@ -314,6 +329,11 @@ public class ReceiveFragment extends Fragment {
         animateFadeOut(statsCard);
         animateFadeOut(chatCard);
         if (nowPlayingCard != null) animateFadeOut(nowPlayingCard);
+        if (ivReceiveAlbumArt != null) {
+            ivReceiveAlbumArt.setImageResource(R.drawable.ic_music_note);
+            ivReceiveAlbumArt.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+            ivReceiveAlbumArt.setPadding(16, 16, 16, 16);
+        }
 
         btnReceive.setText("Start Receiving");
         btnReceive.setBackgroundTintList(
@@ -350,9 +370,24 @@ public class ReceiveFragment extends Fragment {
     }
 
     public void updateNowPlayingMeta(String title, String subtitle) {
+        updateNowPlayingMeta(title, subtitle, null);
+    }
+
+    public void updateNowPlayingMeta(String title, String subtitle, Bitmap albumArt) {
         if (getView() == null || nowPlayingCard == null) return;
         if (title != null) tvNowPlayingTitle.setText(title);
         if (subtitle != null) tvNowPlayingSubtitle.setText(subtitle);
+        if (ivReceiveAlbumArt != null) {
+            if (albumArt != null) {
+                ivReceiveAlbumArt.setImageBitmap(albumArt);
+                ivReceiveAlbumArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                ivReceiveAlbumArt.setPadding(0, 0, 0, 0);
+            } else {
+                ivReceiveAlbumArt.setImageResource(R.drawable.ic_music_note);
+                ivReceiveAlbumArt.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+                ivReceiveAlbumArt.setPadding(16, 16, 16, 16);
+            }
+        }
     }
 
     public void setNowPlayingState(String label, int colorRes) {
@@ -364,8 +399,12 @@ public class ReceiveFragment extends Fragment {
     }
 
     public void setPlayPauseIcon(boolean paused) {
+        int resId = paused ? R.drawable.ic_play : R.drawable.ic_pause;
         if (btnPlayPause != null) {
-            btnPlayPause.setImageResource(paused ? R.drawable.ic_play : R.drawable.ic_pause);
+            btnPlayPause.setImageResource(resId);
+        }
+        if (btnPlayPauseMini != null) {
+            btnPlayPauseMini.setImageResource(resId);
         }
     }
 

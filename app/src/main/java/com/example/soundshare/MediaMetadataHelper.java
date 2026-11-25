@@ -5,6 +5,7 @@ import android.content.ContentResolver;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.media.AudioManager;
 import android.media.MediaMetadata;
 import android.media.session.MediaController;
 import android.media.session.MediaSessionManager;
@@ -13,6 +14,7 @@ import android.net.Uri;
 import android.os.SystemClock;
 import android.service.notification.NotificationListenerService;
 import android.util.Log;
+import android.view.KeyEvent;
 
 import java.io.InputStream;
 import java.util.List;
@@ -20,6 +22,18 @@ import java.util.List;
 public class MediaMetadataHelper {
 
     private static final String TAG = "MediaMetadataHelper";
+
+    /** Longest side of album art decoded from a content URI (services F11). */
+    private static final int ART_MAX_SIDE = 512;
+    /** Window in which a media-session callback is treated as the echo of our own key. */
+    private static final long ECHO_WINDOW_MS = 500;
+    private static volatile long sLastSelfDispatchUptime = -ECHO_WINDOW_MS * 2;
+
+    /** Last URI-decoded art (decoding is skipped while the URI is unchanged). */
+    private static final Object ART_CACHE_LOCK = new Object();
+    private static String sCachedArtUri;
+    private static Bitmap sCachedArt;
+    private static boolean sCachedArtDownsampled;
 
     public static class NowPlayingInfo {
         public final String title;
@@ -136,16 +150,15 @@ public class MediaMetadataHelper {
                 String uriStr = meta.getString(key);
                 if (uriStr == null || uriStr.isEmpty()) continue;
 
-                Uri uri = Uri.parse(uriStr);
-                InputStream is = context.getContentResolver().openInputStream(uri);
-                if (is != null) {
-                    Bitmap bmp = BitmapFactory.decodeStream(is);
-                    is.close();
-                    if (bmp != null) {
-                        Log.d(TAG, "Loaded from URI: " + bmp.getWidth() + "x" + bmp.getHeight());
-                        if (bmp.getWidth() > 400) return bmp; // Good quality
-                        if (bestArt == null) bestArt = bmp;
-                    }
+                boolean[] downsampled = new boolean[1];
+                // Cache key includes title/album: some apps reuse one URI for every track.
+                String cacheKey = uriStr + "|" + meta.getString(MediaMetadata.METADATA_KEY_TITLE)
+                        + "|" + meta.getString(MediaMetadata.METADATA_KEY_ALBUM);
+                Bitmap bmp = decodeUriArt(context, uriStr, cacheKey, downsampled);
+                if (bmp != null) {
+                    // A downsampled decode (source > ART_MAX_SIDE) is good quality by definition.
+                    if (bmp.getWidth() > 400 || downsampled[0]) return bmp;
+                    if (bestArt == null) bestArt = bmp;
                 }
             } catch (Exception ignored) {}
         }
@@ -165,7 +178,50 @@ public class MediaMetadataHelper {
         return bestArt;
     }
 
-    // Transport controls (unchanged)
+    /**
+     * Decodes art from a content URI with inSampleSize so the longest side is <= ART_MAX_SIDE
+     * (a 3000x3000 cover would otherwise be a ~36 MB bitmap, decoded every second on the UI
+     * thread). The result is cached per (URI, title, album).
+     */
+    private static Bitmap decodeUriArt(Context context, String uriStr, String cacheKey,
+                                       boolean[] downsampledOut) throws Exception {
+        synchronized (ART_CACHE_LOCK) {
+            if (cacheKey.equals(sCachedArtUri) && sCachedArt != null && !sCachedArt.isRecycled()) {
+                downsampledOut[0] = sCachedArtDownsampled;
+                return sCachedArt;
+            }
+        }
+        Uri uri = Uri.parse(uriStr);
+        ContentResolver cr = context.getContentResolver();
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        try (InputStream is = cr.openInputStream(uri)) {
+            if (is == null) return null;
+            BitmapFactory.decodeStream(is, null, bounds);
+        }
+        int longest = Math.max(bounds.outWidth, bounds.outHeight);
+        if (longest <= 0) return null;
+        int sample = 1;
+        while (longest / sample > ART_MAX_SIDE) sample *= 2;
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = sample;
+        Bitmap bmp;
+        try (InputStream is = cr.openInputStream(uri)) {
+            if (is == null) return null;
+            bmp = BitmapFactory.decodeStream(is, null, opts);
+        }
+        downsampledOut[0] = sample > 1;
+        if (bmp != null) {
+            synchronized (ART_CACHE_LOCK) {
+                sCachedArtUri = cacheKey;
+                sCachedArt = bmp;
+                sCachedArtDownsampled = sample > 1;
+            }
+        }
+        return bmp;
+    }
+
+    // Transport controls
     private static MediaController getActiveController(Context context) {
         try {
             MediaSessionManager msm = (MediaSessionManager)
@@ -197,28 +253,80 @@ public class MediaMetadataHelper {
         }
     }
 
-    public static void sendPlay(Context context) {
-        MediaController mc = getActiveController(context);
-        if (mc != null && mc.getTransportControls() != null)
-            mc.getTransportControls().play();
+    /**
+     * True for ~500 ms after SoundShare dispatched a media key itself. The system may route that
+     * key back to SoundShare's own media session; session callbacks ignore it (FIX_PLAN #9).
+     */
+    public static boolean isEcho() {
+        return SystemClock.uptimeMillis() - sLastSelfDispatchUptime < ECHO_WINDOW_MS;
     }
 
-    public static void sendPause(Context context) {
+    private static void markSelfDispatch() {
+        sLastSelfDispatchUptime = SystemClock.uptimeMillis();
+    }
+
+    public static void dispatchMediaKey(Context context, int keyCode) {
+        markSelfDispatch();
+        try {
+            AudioManager am = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+            if (am != null) {
+                long eventTime = SystemClock.uptimeMillis();
+                am.dispatchMediaKeyEvent(new KeyEvent(eventTime, eventTime, KeyEvent.ACTION_DOWN, keyCode, 0));
+                am.dispatchMediaKeyEvent(new KeyEvent(eventTime, eventTime, KeyEvent.ACTION_UP, keyCode, 0));
+            }
+        } catch (Exception ignored) {}
+    }
+
+    /** Sender behaviour: falls back to a media key when no other app's session is found. */
+    public static void sendPlay(Context context) {
+        sendPlay(context, true);
+    }
+
+    /**
+     * @param allowKeyFallback dispatch KEYCODE_MEDIA_PLAY when no controller is found. Pass false
+     *                         on devices that play audio themselves (duplex/receiver): there the
+     *                         key would be routed to SoundShare's own session and loop.
+     */
+    public static void sendPlay(Context context, boolean allowKeyFallback) {
         MediaController mc = getActiveController(context);
-        if (mc != null && mc.getTransportControls() != null)
+        if (mc != null && mc.getTransportControls() != null) {
+            mc.getTransportControls().play();
+            return;
+        }
+        if (allowKeyFallback) dispatchMediaKey(context, KeyEvent.KEYCODE_MEDIA_PLAY);
+    }
+
+    /** Sender behaviour: falls back to a media key when no other app's session is found. */
+    public static void sendPause(Context context) {
+        sendPause(context, true);
+    }
+
+    /** @param allowKeyFallback see {@link #sendPlay(Context, boolean)} */
+    public static void sendPause(Context context, boolean allowKeyFallback) {
+        MediaController mc = getActiveController(context);
+        if (mc != null && mc.getTransportControls() != null) {
             mc.getTransportControls().pause();
+            return;
+        }
+        if (allowKeyFallback) dispatchMediaKey(context, KeyEvent.KEYCODE_MEDIA_PAUSE);
     }
 
     public static void sendSkipNext(Context context) {
         MediaController mc = getActiveController(context);
-        if (mc != null && mc.getTransportControls() != null)
+        if (mc != null && mc.getTransportControls() != null) {
             mc.getTransportControls().skipToNext();
+            return;
+        }
+        dispatchMediaKey(context, KeyEvent.KEYCODE_MEDIA_NEXT);
     }
 
     public static void sendSkipPrevious(Context context) {
         MediaController mc = getActiveController(context);
-        if (mc != null && mc.getTransportControls() != null)
+        if (mc != null && mc.getTransportControls() != null) {
             mc.getTransportControls().skipToPrevious();
+            return;
+        }
+        dispatchMediaKey(context, KeyEvent.KEYCODE_MEDIA_PREVIOUS);
     }
 
     public static class NLService extends NotificationListenerService {}

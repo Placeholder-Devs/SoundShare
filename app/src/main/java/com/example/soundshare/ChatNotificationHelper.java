@@ -53,12 +53,15 @@ public class ChatNotificationHelper {
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // Delete old channel if exists (in case settings were cached)
             NotificationManager manager =
                     context.getSystemService(NotificationManager.class);
-            if (manager != null) {
+            if (manager == null) return;
+            // Remove the legacy channel only if it still exists (one-time migration).
+            if (manager.getNotificationChannel("soundshare_chat") != null) {
                 manager.deleteNotificationChannel("soundshare_chat");
             }
+            // Create once; never delete + re-create (FIX_PLAN #25).
+            if (manager.getNotificationChannel(CHANNEL_ID) != null) return;
 
             Uri soundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
 
@@ -82,10 +85,8 @@ public class ChatNotificationHelper {
             channel.setLockscreenVisibility(android.app.Notification.VISIBILITY_PUBLIC);
             channel.setBypassDnd(false);
 
-            if (manager != null) {
-                manager.createNotificationChannel(channel);
-                Log.i(TAG, "Notification channel created: " + CHANNEL_ID);
-            }
+            manager.createNotificationChannel(channel);
+            Log.i(TAG, "Notification channel created: " + CHANNEL_ID);
         }
     }
 
@@ -212,8 +213,8 @@ public class ChatNotificationHelper {
 
             manager.notify(NOTIFICATION_ID, builder.build());
 
-            Log.i(TAG, "Notification posted: " + sender + " - " + message
-                    + " (unread: " + unreadCount + ")");
+            // Never log chat sender or text (privacy, FIX_PLAN #25 / #32).
+            Log.i(TAG, "Notification posted (unread: " + unreadCount + ")");
 
         } catch (SecurityException e) {
             Log.e(TAG, "SecurityException posting notification", e);

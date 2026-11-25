@@ -102,7 +102,9 @@ public class LyricsHelper {
 
         new Thread(() -> {
             // 2. Check disk cache
-            File cacheFile = new File(context.getCacheDir(), "lyrics_v2_" + trackId + ".json");
+            // trackId can come from a peer over the network: sanitize before building a path.
+            File cacheFile = new File(context.getCacheDir(),
+                    "lyrics_v2_" + NetUtils.sanitizeFileName(trackId) + ".json");
             if (cacheFile.exists() && cacheFile.length() > 0) {
                 try {
                     String jsonStr = readFile(cacheFile);

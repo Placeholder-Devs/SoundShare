@@ -3,7 +3,9 @@ package com.example.soundshare;
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
 import android.animation.ObjectAnimator;
+import android.animation.PropertyValuesHolder;
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -13,6 +15,7 @@ import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageButton;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.Spinner;
 import android.widget.TextView;
@@ -55,6 +58,7 @@ public class StreamFragment extends Fragment {
     private ImageButton btnChatSend;
 
     // Now Playing
+    private ImageView ivStreamAlbumArt;
     private TextView tvNowPlayingTitle, tvNowPlayingSubtitle;
     private TextView tvNowPlayingElapsed, tvNowPlayingStatus;
     private View nowPlayingDot;
@@ -104,6 +108,7 @@ public class StreamFragment extends Fragment {
         btnChatSend = v.findViewById(R.id.btnChatSend);
 
         nowPlayingCard = v.findViewById(R.id.nowPlayingCard);
+        ivStreamAlbumArt = v.findViewById(R.id.ivStreamAlbumArt);
         tvNowPlayingTitle = v.findViewById(R.id.tvNowPlayingTitle);
         tvNowPlayingSubtitle = v.findViewById(R.id.tvNowPlayingSubtitle);
         tvNowPlayingElapsed = v.findViewById(R.id.tvNowPlayingElapsed);
@@ -184,6 +189,9 @@ public class StreamFragment extends Fragment {
 
     /** Scale button down then back up — tactile press feel */
     private void animateButtonPress(View view) {
+        if (getContext() != null && SettingsFragment.isHapticFeedback(getContext())) {
+            view.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY);
+        }
         view.animate()
             .scaleX(0.92f).scaleY(0.92f)
             .setDuration(80)
@@ -224,17 +232,15 @@ public class StreamFragment extends Fragment {
     /** Continuous pulse on the status dot */
     private void startPulse(View dot, float minScale, float maxScale) {
         if (pulseAnimator != null) pulseAnimator.cancel();
-        pulseAnimator = ObjectAnimator.ofFloat(dot, "scaleX", minScale, maxScale, minScale);
+        // One animator for X and Y so stopPulse() cancels both (the separate, untracked
+        // scaleY animator used to keep running forever, one more per start).
+        pulseAnimator = ObjectAnimator.ofPropertyValuesHolder(dot,
+                PropertyValuesHolder.ofFloat(View.SCALE_X, minScale, maxScale, minScale),
+                PropertyValuesHolder.ofFloat(View.SCALE_Y, minScale, maxScale, minScale));
         pulseAnimator.setDuration(1200);
         pulseAnimator.setRepeatCount(ObjectAnimator.INFINITE);
         pulseAnimator.setInterpolator(new AccelerateDecelerateInterpolator());
-        // Also pulse scaleY
-        ObjectAnimator pulseY = ObjectAnimator.ofFloat(dot, "scaleY", minScale, maxScale, minScale);
-        pulseY.setDuration(1200);
-        pulseY.setRepeatCount(ObjectAnimator.INFINITE);
-        pulseY.setInterpolator(new AccelerateDecelerateInterpolator());
         pulseAnimator.start();
-        pulseY.start();
     }
 
     private void stopPulse() {
@@ -245,6 +251,12 @@ public class StreamFragment extends Fragment {
     }
 
     // ===== PUBLIC UPDATE METHODS (called by MainActivity) =====
+
+    /** Quality spinner (null before onViewCreated); MainActivity re-filters it after capability detection. */
+    @Nullable
+    public Spinner getQualitySpinner() {
+        return qualitySpinner;
+    }
 
     public void setDeviceIp(String ip) {
         if (tvDeviceIp != null) tvDeviceIp.setText(ip);
@@ -295,6 +307,11 @@ public class StreamFragment extends Fragment {
         animateFadeOut(statsCard);
         animateFadeOut(chatCard);
         if (nowPlayingCard != null) animateFadeOut(nowPlayingCard);
+        if (ivStreamAlbumArt != null) {
+            ivStreamAlbumArt.setImageResource(R.drawable.ic_music_note);
+            ivStreamAlbumArt.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+            ivStreamAlbumArt.setPadding(16, 16, 16, 16);
+        }
 
         btnSend.setText("Start Streaming");
         btnSend.setBackgroundTintList(
@@ -345,9 +362,24 @@ public class StreamFragment extends Fragment {
     }
 
     public void updateNowPlayingMeta(String title, String subtitle) {
+        updateNowPlayingMeta(title, subtitle, null);
+    }
+
+    public void updateNowPlayingMeta(String title, String subtitle, Bitmap albumArt) {
         if (getView() == null || nowPlayingCard == null) return;
         if (title != null) tvNowPlayingTitle.setText(title);
         if (subtitle != null) tvNowPlayingSubtitle.setText(subtitle);
+        if (ivStreamAlbumArt != null) {
+            if (albumArt != null) {
+                ivStreamAlbumArt.setImageBitmap(albumArt);
+                ivStreamAlbumArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                ivStreamAlbumArt.setPadding(0, 0, 0, 0);
+            } else {
+                ivStreamAlbumArt.setImageResource(R.drawable.ic_music_note);
+                ivStreamAlbumArt.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+                ivStreamAlbumArt.setPadding(16, 16, 16, 16);
+            }
+        }
     }
 
     public void setNowPlayingState(String label, int colorRes) {

@@ -400,6 +400,33 @@
             android:padding="18dp"
             android:layout_marginBottom="16dp">
 
+            <!-- Hero Album Artwork Card -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:orientation="vertical"
+                android:layout_marginBottom="14dp">
+
+                <androidx.cardview.widget.CardView
+                    android:id="@+id/receiveCardAlbumArt"
+                    android:layout_width="200dp"
+                    android:layout_height="200dp"
+                    app:cardCornerRadius="18dp"
+                    app:cardElevation="8dp"
+                    app:cardBackgroundColor="@color/card_dark_elevated">
+
+                    <ImageView
+                        android:id="@+id/ivReceiveAlbumArt"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:scaleType="centerInside"
+                        android:src="@drawable/ic_music_note"
+                        android:padding="16dp"
+                        android:contentDescription="Album Art" />
+                </androidx.cardview.widget.CardView>
+            </LinearLayout>
+
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -444,7 +471,7 @@
                     android:layout_marginEnd="8dp" />
 
                 <ImageButton
-                    android:id="@+id/btnPlayPause"
+                    android:id="@+id/btnPlayPauseMini"
                     android:layout_width="48dp"
                     android:layout_height="48dp"
                     android:src="@drawable/ic_pause"
